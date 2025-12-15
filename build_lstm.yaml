@@ -1,17 +1,14 @@
-name: Initialize LSTM Model
-description: Initializes the LSTM model.
+name: Initialize LSTM Model v1
+description: Initializes the LSTM model using processed input dimension.
 inputs:
   - {name: config, type: String}
+  - {name: processed_data, type: Dataset}
 outputs:
   - {name: model, type: Model}
 implementation:
   container:
     image: gurpreetgandhi/nesy-factory:v25
     command:
-      - sh
-      - -c
-      - |
-        exec "$0" "$@"
       - python3
       - -u
       - -c
@@ -19,20 +16,36 @@ implementation:
         import argparse
         import json
         import os
-        import sys
         import torch
+        import cloudpickle
 
         from nesy_factory.RNNs import LSTM
 
+        def ensure_dir_for(path):
+            d = os.path.dirname(path)
+            if d and not os.path.exists(d):
+                os.makedirs(d, exist_ok=True)
+
         parser = argparse.ArgumentParser()
         parser.add_argument('--config', type=str, required=True)
+        parser.add_argument('--processed_data', type=str, required=True)
         parser.add_argument('--model', type=str, required=True)
         args = parser.parse_args()
 
+        # Load config
         config = json.loads(args.config)
 
+        # Load processed data (contains input_dim)
+        with open(args.processed_data, 'rb') as f:
+            data_wrapper = cloudpickle.load(f)
+
+        input_dim = data_wrapper.input_dim
+
+        print('[INFO] Using input_dim from processed data:', input_dim)
+
+        # Build model config
         model_config = {
-            'input_dim': len(config['feature_columns']),
+            'input_dim': input_dim,
             'hidden_dim': config['hidden_dim'],
             'output_dim': 1,
             'num_layers': config['num_layers'],
@@ -43,15 +56,22 @@ implementation:
             'loss_function': config['loss_function']
         }
 
+        # Initialize model
         model_obj = LSTM(model_config)
 
-        os.makedirs(os.path.dirname(args.model), exist_ok=True)
-
+        # Save model
+        ensure_dir_for(args.model)
         torch.save(model_obj, args.model)
 
-        print(f"Saved LSTM model to {args.model}")
+        print('[SUCCESS] LSTM model initialized')
+        print('[INFO] input_dim:', input_dim)
+        print('[INFO] hidden_dim:', config['hidden_dim'])
+        print('[INFO] num_layers:', config['num_layers'])
+        print('[INFO] Model saved to:', args.model)
     args:
       - --config
       - {inputValue: config}
+      - --processed_data
+      - {inputPath: processed_data}
       - --model
       - {outputPath: model}
