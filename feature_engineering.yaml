@@ -1,4 +1,4 @@
-name: Time Series Preprocessing v2.0
+name: Time Series Preprocessing v2.1
 inputs:
   - {name: cleaned_data, type: Dataset, description: "Cleaned dataset from previous component"}
   - {name: cleaning_metadata, type: Data, description: "Metadata from cleaning component"}
@@ -152,31 +152,35 @@ implementation:
             raise ValueError(f'Failed to parse date column "{date_col}". Please check the date format.')
 
         def create_lag_features(df, columns, lag_periods):
-            print('[INFO] Creating lag features for', len(columns), 'columns with lags:', lag_periods)
-            for col in columns:
-                if col not in df.columns:
-                    continue
+            numeric_cols = [col for col in columns if col in df.columns and pd.api.types.is_numeric_dtype(df[col])]
+            print('[INFO] Creating lag features for', len(numeric_cols), 'numeric columns with lags:', lag_periods)
+            print('[INFO] Numeric columns:', numeric_cols[:5], '...' if len(numeric_cols) > 5 else '')
+            
+            for col in numeric_cols:
                 for lag in lag_periods:
                     df[col + '_lag_' + str(lag)] = df[col].shift(lag)
             return df
-
+        
         def create_rolling_features(df, columns, rolling_windows):
-            print('[INFO] Creating rolling features for', len(columns), 'columns with windows:', rolling_windows)
-            for col in columns:
-                if col not in df.columns:
-                    continue
+            numeric_cols = [col for col in columns if col in df.columns and pd.api.types.is_numeric_dtype(df[col])]
+            print('[INFO] Creating rolling features for', len(numeric_cols), 'numeric columns with windows:', rolling_windows)
+            print('[INFO] Numeric columns:', numeric_cols[:5], '...' if len(numeric_cols) > 5 else '')
+            
+            for col in numeric_cols:
                 for window in rolling_windows:
                     df[col + '_rolling_mean_' + str(window)] = df[col].rolling(window).mean()
                     df[col + '_rolling_std_' + str(window)] = df[col].rolling(window).std()
                     df[col + '_rolling_min_' + str(window)] = df[col].rolling(window).min()
                     df[col + '_rolling_max_' + str(window)] = df[col].rolling(window).max()
             return df
-
+        
         def create_diff_features(df, columns):
-            print('[INFO] Creating difference features for', len(columns), 'columns')
-            for col in columns:
-                if col not in df.columns:
-                    continue
+            # Filter to numeric columns only
+            numeric_cols = [col for col in columns if col in df.columns and pd.api.types.is_numeric_dtype(df[col])]
+            print('[INFO] Creating difference features for', len(numeric_cols), 'numeric columns')
+            print('[INFO] Numeric columns:', numeric_cols[:5], '...' if len(numeric_cols) > 5 else '')
+            
+            for col in numeric_cols:
                 df[col + '_diff'] = df[col].diff()
                 df[col + '_pct_change'] = df[col].pct_change()
             return df
