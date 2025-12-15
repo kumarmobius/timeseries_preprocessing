@@ -1,8 +1,7 @@
-name: Time Series Preprocessing v1.0
+name: Time Series Preprocessing v2.0
 inputs:
   - {name: cleaned_data, type: Dataset, description: "Cleaned dataset from previous component"}
   - {name: cleaning_metadata, type: Data, description: "Metadata from cleaning component"}
-  - {name: date_column, type: String, description: "Name of datetime column for sorting"}
   - {name: target_column, type: String, description: "Target column name to predict"}
   - {name: feature_columns, type: String, description: "Comma-separated feature columns (leave empty to use all except target and date)", optional: true, default: ""}
   - {name: seq_length, type: Integer, description: "Sequence window size for LSTM/RNN", optional: true, default: "10"}
@@ -48,6 +47,109 @@ implementation:
             if not s or s.strip() == "":
                 return []
             return [dtype(x.strip()) for x in s.split(',') if x.strip()]
+
+        def auto_detect_date_column(df):
+            print('[INFO] Auto-detecting date column...')
+            
+            date_keywords = ['date', 'time', 'timestamp', 'datetime', 'day', 'month', 'year', 
+                           'created', 'updated', 'modified', 'released', 'release']
+            
+            candidate_columns = []
+            
+            # First pass: Check column names for date-related keywords
+            for col in df.columns:
+                col_lower = col.lower()
+                if any(keyword in col_lower for keyword in date_keywords):
+                    candidate_columns.append((col, 100))  # High priority
+            
+            # Second pass: Try to parse each column as datetime
+            for col in df.columns:
+                if col in [c[0] for c in candidate_columns]:
+                    continue
+                
+                # Skip numeric columns
+                if pd.api.types.is_numeric_dtype(df[col]):
+                    continue
+                
+                # Try parsing a sample of the column
+                try:
+                    sample = df[col].dropna().head(100)
+                    if len(sample) == 0:
+                        continue
+                    
+                    # Try to parse with mixed format
+                    parsed = pd.to_datetime(sample, errors='coerce', format='mixed', dayfirst=True)
+                    
+                    # If more than 80% parsed successfully, it's likely a date column
+                    success_rate = parsed.notna().sum() / len(sample)
+                    if success_rate > 0.8:
+                        candidate_columns.append((col, success_rate * 50))  # Medium priority
+                        print(f'[INFO] Found potential date column: {col} (success rate: {success_rate:.2%})')
+                
+                except Exception as e:
+                    continue
+            
+            if not candidate_columns:
+                print('[WARN] No date column detected. Proceeding without temporal ordering.')
+                return None
+            
+            # Sort by priority (highest first) and return the best candidate
+            candidate_columns.sort(key=lambda x: x[1], reverse=True)
+            detected_col = candidate_columns[0][0]
+            
+            print(f'[INFO] Selected date column: {detected_col}')
+            return detected_col
+
+        def parse_date_column(df, date_col):
+            print(f'[INFO] Parsing date column: {date_col}')
+            
+            original_dtype = df[date_col].dtype
+            print(f'[INFO] Original dtype: {original_dtype}')
+            
+            # If already datetime, return as-is
+            if pd.api.types.is_datetime64_any_dtype(df[date_col]):
+                print('[INFO] Column is already datetime type')
+                return df[date_col]
+            
+            # Try multiple parsing strategies
+            strategies = [
+                # Strategy 1: Mixed format with dayfirst=True (for DD-MM-YYYY)
+                lambda x: pd.to_datetime(x, errors='coerce', format='mixed', dayfirst=True),
+                
+                # Strategy 2: Mixed format with dayfirst=False (for MM-DD-YYYY)
+                lambda x: pd.to_datetime(x, errors='coerce', format='mixed', dayfirst=False),
+                
+                # Strategy 3: ISO8601 format
+                lambda x: pd.to_datetime(x, errors='coerce', format='ISO8601'),
+                
+                # Strategy 4: Infer format
+                lambda x: pd.to_datetime(x, errors='coerce', infer_datetime_format=True),
+            ]
+            
+            for i, strategy in enumerate(strategies, 1):
+                try:
+                    parsed = strategy(df[date_col])
+                    success_rate = parsed.notna().sum() / len(df[date_col])
+                    
+                    print(f'[INFO] Strategy {i} success rate: {success_rate:.2%}')
+                    
+                    if success_rate > 0.95:  # At least 95% success
+                        print(f'[INFO] Using strategy {i} (success rate: {success_rate:.2%})')
+                        
+                        # Show sample of parsed dates
+                        sample_original = df[date_col].dropna().head(3).tolist()
+                        sample_parsed = parsed.dropna().head(3).tolist()
+                        print(f'[INFO] Sample original: {sample_original}')
+                        print(f'[INFO] Sample parsed: {sample_parsed}')
+                        
+                        return parsed
+                
+                except Exception as e:
+                    print(f'[WARN] Strategy {i} failed: {str(e)}')
+                    continue
+            
+            # If all strategies fail, raise error
+            raise ValueError(f'Failed to parse date column "{date_col}". Please check the date format.')
 
         def create_lag_features(df, columns, lag_periods):
             print('[INFO] Creating lag features for', len(columns), 'columns with lags:', lag_periods)
@@ -103,7 +205,7 @@ implementation:
                     df[col] = df[col].map(freq_map).fillna(0)
                     encoding_info[col] = {
                         'type': 'frequency',
-                        'mapping': freq_map
+                        'mapping': {str(k): int(v) for k, v in list(freq_map.items())[:10]}  # Save only top 10
                     }
                     print('[INFO] Frequency encoded', col)
             
@@ -162,7 +264,7 @@ implementation:
                 
             def fit(self, df, config):
                 self.target_column = config['target_column']
-                self.date_column = config['date_column']
+                self.date_column = config.get('date_column')
                 self.seq_length = config['seq_length']
                 self.lag_periods = config['lag_periods']
                 self.rolling_windows = config['rolling_windows']
@@ -171,16 +273,19 @@ implementation:
                 self.create_diff_features = config['create_diff_features']
                 self.unique_threshold = config.get('unique_threshold', 0.95)
                 
-                self.feature_columns = [c for c in df.columns 
-                                       if c not in [self.target_column, self.date_column]]
+                exclude_cols = [self.target_column]
+                if self.date_column:
+                    exclude_cols.append(self.date_column)
+                
+                self.feature_columns = [c for c in df.columns if c not in exclude_cols]
                 
                 return self
                 
             def transform(self, df):
                 df = df.copy()
                 
-                if self.date_column in df.columns:
-                    df[self.date_column] = pd.to_datetime(df[self.date_column])
+                if self.date_column and self.date_column in df.columns:
+                    df[self.date_column] = parse_date_column(df, self.date_column)
                     df = df.sort_values(by=self.date_column).reset_index(drop=True)
                 
                 if self.create_lags and self.lag_periods:
@@ -194,10 +299,13 @@ implementation:
                 
                 df = df.bfill().ffill()
                 
-                exclude = [self.target_column, self.date_column] if self.date_column in df.columns else [self.target_column]
+                exclude = [self.target_column]
+                if self.date_column and self.date_column in df.columns:
+                    exclude.append(self.date_column)
+                
                 df, _ = encode_categorical_safe(df, exclude_cols=exclude)
                 
-                final_features = [c for c in df.columns if c not in [self.target_column, self.date_column]]
+                final_features = [c for c in df.columns if c not in exclude]
                 
                 df, final_features, _, _ = drop_high_uniqueness_columns(df, final_features, self.unique_threshold)
                 
@@ -236,7 +344,6 @@ implementation:
         parser = argparse.ArgumentParser()
         parser.add_argument('--cleaned_data', type=str, required=True)
         parser.add_argument('--cleaning_metadata', type=str, required=True)
-        parser.add_argument('--date_column', type=str, required=True)
         parser.add_argument('--target_column', type=str, required=True)
         parser.add_argument('--feature_columns', type=str, default="")
         parser.add_argument('--seq_length', type=int, default=10)
@@ -255,7 +362,7 @@ implementation:
 
         try:
             print("="*80)
-            print("TIME SERIES PREPROCESSING")
+            print("TIME SERIES PREPROCESSING v2.0 (AUTO DATE DETECTION)")
             print("="*80)
             
             create_lags = args.create_lags.lower() in ('true', 't', 'yes', 'y', '1')
@@ -268,36 +375,46 @@ implementation:
             print('[STEP 1/13] Loading data...')
             df = pd.read_parquet(args.cleaned_data)
             print('[INFO] Loaded data shape:', df.shape)
+            print('[INFO] Columns:', list(df.columns))
             
             with open(args.cleaning_metadata, 'r') as f:
                 cleaning_meta = json.load(f)
             
-            print('[STEP 2/13] Validating columns...')
-            if args.date_column not in df.columns:
-                raise ValueError('Date column not found: ' + args.date_column)
-            
+            print('[STEP 2/13] Validating target column...')
             if args.target_column not in df.columns:
                 raise ValueError('Target column not found: ' + args.target_column)
+            print('[INFO] Target column:', args.target_column)
             
+            print('[STEP 3/13] Auto-detecting date column...')
+            date_column = auto_detect_date_column(df)
+            
+            if date_column:
+                print('[INFO] Detected date column:', date_column)
+                
+                print('[STEP 4/13] Parsing and sorting by date (CRITICAL for time series)...')
+                df[date_column] = parse_date_column(df, date_column)
+                df = df.sort_values(by=date_column).reset_index(drop=True)
+                print('[INFO] Date range:', df[date_column].min(), 'to', df[date_column].max())
+            else:
+                print('[WARN] No date column detected - proceeding without temporal ordering')
+                print('[WARN] This may impact time series model performance')
+            
+            print('[STEP 5/13] Determining feature columns...')
             if args.feature_columns.strip():
                 feature_cols = parse_comma_separated(args.feature_columns, str)
                 missing = [c for c in feature_cols if c not in df.columns]
                 if missing:
                     raise ValueError('Feature columns not found: ' + str(missing))
             else:
-                feature_cols = [c for c in df.columns 
-                               if c not in [args.target_column, args.date_column]]
+                exclude = [args.target_column]
+                if date_column:
+                    exclude.append(date_column)
+                feature_cols = [c for c in df.columns if c not in exclude]
             
-            print('[INFO] Target column:', args.target_column)
-            print('[INFO] Date column:', args.date_column)
             print('[INFO] Feature columns:', len(feature_cols))
+            print('[INFO] Features:', feature_cols[:5], '...' if len(feature_cols) > 5 else '')
             
-            print('[STEP 3/13] Sorting by date (CRITICAL for time series)...')
-            df[args.date_column] = pd.to_datetime(df[args.date_column])
-            df = df.sort_values(by=args.date_column).reset_index(drop=True)
-            print('[INFO] Date range:', df[args.date_column].min(), 'to', df[args.date_column].max())
-            
-            print('[STEP 4/13] Creating time series features...')
+            print('[STEP 6/13] Creating time series features...')
             initial_shape = df.shape
             
             if create_lags and lag_periods:
@@ -312,7 +429,7 @@ implementation:
             print('[INFO] Shape after feature engineering:', df.shape)
             print('[INFO] Created', df.shape[1] - initial_shape[1], 'new features')
             
-            print('[STEP 5/13] Handling missing values (backward-fill)...')
+            print('[STEP 7/13] Handling missing values (backward-fill then forward-fill)...')
             nan_before = df.isna().sum().sum()
             df = df.bfill()
             df = df.ffill()
@@ -321,37 +438,40 @@ implementation:
             print('[INFO] NaN values:', nan_before, '->', nan_after)
             print('[INFO] Shape after dropping NaN:', df.shape)
             
-            print('[STEP 6/13] Encoding categorical features...')
-            exclude_cols = [args.target_column, args.date_column]
+            print('[STEP 8/13] Encoding categorical features...')
+            exclude_cols = [args.target_column]
+            if date_column:
+                exclude_cols.append(date_column)
+            
             df, encoding_info = encode_categorical_safe(df, exclude_cols=exclude_cols)
             print('[INFO] Shape after encoding:', df.shape)
             
-            print('[STEP 7/13] Dropping high-uniqueness columns (IDs, emails, etc.)...')
+            print('[STEP 9/13] Dropping high-uniqueness columns (IDs, emails, etc.)...')
             final_feature_cols = [c for c in df.columns 
-                                 if c not in [args.target_column, args.date_column]]
+                                 if c not in ([args.target_column] + ([date_column] if date_column else []))]
             
             df, final_feature_cols, dropped_unique_cols, uniqueness_report = drop_high_uniqueness_columns(
                 df, final_feature_cols, args.unique_threshold
             )
             print('[INFO] Shape after dropping unique columns:', df.shape)
             
-            print('[STEP 8/13] Preparing features and target...')
+            print('[STEP 10/13] Preparing features and target...')
             X = df[final_feature_cols].values
             y = df[args.target_column].values
             print('[INFO] Features shape:', X.shape)
             print('[INFO] Target shape:', y.shape)
             
-            print('[STEP 9/13] Scaling features...')
+            print('[STEP 11/13] Scaling features...')
             scaler = MinMaxScaler()
             X_scaled = scaler.fit_transform(X)
             print('[INFO] Scaling complete')
             
-            print('[STEP 10/13] Creating sequences (window size=' + str(args.seq_length) + ')...')
+            print('[STEP 12/13] Creating sequences (window size=' + str(args.seq_length) + ')...')
             X_seq, y_seq = create_sequences(X_scaled, y, args.seq_length)
             print('[INFO] Sequence shape:', X_seq.shape)
             print('[INFO] Labels shape:', y_seq.shape)
             
-            print('[STEP 11/13] Splitting into train/test (chronological, no shuffle)...')
+            print('[STEP 13/13] Splitting into train/test (chronological, no shuffle)...')
             train_size = int(len(X_seq) * (1 - args.test_split))
             
             X_train = X_seq[:train_size]
@@ -376,7 +496,7 @@ implementation:
             input_dim = X_train.shape[2]
             print('[INFO] Input dimension (features):', input_dim)
             
-            print('[STEP 12/13] Saving outputs...')
+            print('[STEP 14/14] Saving outputs...')
             
             data_wrapper = DataWrapper(
                 train_loader=train_loader,
@@ -387,7 +507,7 @@ implementation:
                 metadata={
                     'seq_length': args.seq_length,
                     'target_column': args.target_column,
-                    'date_column': args.date_column,
+                    'date_column': date_column,
                     'train_samples': len(X_train),
                     'test_samples': len(X_test),
                     'train_shape': list(X_train.shape),
@@ -405,7 +525,7 @@ implementation:
             preprocessor = TimeSeriesPreprocessor()
             preprocessor.fit(df, {
                 'target_column': args.target_column,
-                'date_column': args.date_column,
+                'date_column': date_column,
                 'seq_length': args.seq_length,
                 'lag_periods': lag_periods,
                 'rolling_windows': rolling_windows,
@@ -421,10 +541,11 @@ implementation:
             preprocessor.save(args.preprocessor)
             print('[INFO] Saved preprocessor to:', args.preprocessor)
             
-            print('[STEP 13/13] Saving metadata...')
+            print('[STEP 15/15] Saving metadata...')
             metadata = {
                 'timestamp': datetime.utcnow().isoformat() + 'Z',
-                'date_column': args.date_column,
+                'date_column': date_column,
+                'date_column_auto_detected': True,
                 'target_column': args.target_column,
                 'feature_columns': final_feature_cols,
                 'n_features': len(final_feature_cols),
@@ -445,8 +566,8 @@ implementation:
                 },
                 'input_dim': input_dim,
                 'date_range': {
-                    'start': str(df[args.date_column].min()),
-                    'end': str(df[args.date_column].max())
+                    'start': str(df[date_column].min()) if date_column else None,
+                    'end': str(df[date_column].max()) if date_column else None
                 },
                 'initial_shape': list(initial_shape),
                 'final_shape': list(df.shape),
@@ -478,7 +599,7 @@ implementation:
             print('Sequence length:', args.seq_length)
             print('Batch size:', args.batch_size)
             print('Target column:', args.target_column)
-            print('Date column:', args.date_column)
+            print('Date column (auto-detected):', date_column if date_column else 'None')
             print('Dropped unique columns:', len(dropped_unique_cols))
             print("="*80)
             print("SUCCESS: All outputs saved")
@@ -493,8 +614,6 @@ implementation:
       - {inputPath: cleaned_data}
       - --cleaning_metadata
       - {inputPath: cleaning_metadata}
-      - --date_column
-      - {inputValue: date_column}
       - --target_column
       - {inputValue: target_column}
       - --feature_columns
