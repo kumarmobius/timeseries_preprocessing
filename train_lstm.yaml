@@ -9,13 +9,14 @@ outputs:
   - {name: training_metrics, type: Data, description: "Training metrics and loss history"}
 implementation:
   container:
-    image: kumar2004/ml-base:v1
+    image: gurpreetgandhi/nesy-factory:v25
     command:
       - python3
       - -u
       - -c
       - |
         import argparse
+        from nesy_factory.RNNs import LSTM
         import json
         import os
         import pickle
