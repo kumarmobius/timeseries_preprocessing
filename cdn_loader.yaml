@@ -1,0 +1,111 @@
+name: Data loader with cdn
+description: |
+  Download a dataset from a CDN (CSV, JSON, Parquet, Excel),
+  load it into a DataFrame, and split it into train and test datasets.
+  No target handling. No model assumptions. Just data.
+
+inputs:
+  - {name: cdn_url, type: String, description: 'CDN URL to dataset (CSV, JSON, Parquet, XLSX)'}
+  - {name: split_size, type: Float, default: "0.2", description: 'Test split size (fraction like 0.2 or percent like 20)'}
+
+outputs:
+  - {name: train_loader, type: Dataset}
+  - {name: test_loader, type: Dataset}
+
+implementation:
+  container:
+    image: kumar2004/ml-base:v1
+    command:
+      - python3
+      - -u
+      - -c
+      - |
+        import argparse
+        import os
+        import sys
+        import tempfile
+        import logging
+        import json
+        import pandas as pd
+        import requests
+        from sklearn.model_selection import train_test_split
+
+        # -------- CLI --------
+        parser = argparse.ArgumentParser()
+        parser.add_argument('--cdn_url', type=str, required=True)
+        parser.add_argument('--split_size', type=float, default=0.2)
+        parser.add_argument('--train_loader', type=str, required=True)
+        parser.add_argument('--test_loader', type=str, required=True)
+        args = parser.parse_args()
+
+        logging.basicConfig(stream=sys.stdout, level=logging.INFO)
+        logger = logging.getLogger("cdn_simple_loader")
+
+        # -------- Download --------
+        logger.info("Downloading dataset from %s", args.cdn_url)
+        resp = requests.get(args.cdn_url, timeout=30)
+        resp.raise_for_status()
+
+        fd, tmp_path = tempfile.mkstemp()
+        os.close(fd)
+        with open(tmp_path, "wb") as f:
+            f.write(resp.content)
+
+        url = args.cdn_url.lower()
+
+        # -------- Load data --------
+        try:
+            if url.endswith(".parquet"):
+                df = pd.read_parquet(tmp_path)
+            elif url.endswith(".csv"):
+                df = pd.read_csv(tmp_path)
+            elif url.endswith(".xlsx") or url.endswith(".xls"):
+                df = pd.read_excel(tmp_path)
+            elif url.endswith(".json"):
+                with open(tmp_path, "r") as f:
+                    raw = json.load(f)
+                if isinstance(raw, dict):
+                    for k in ("data", "items", "records", "results"):
+                        if k in raw:
+                            raw = raw[k]
+                            break
+                df = pd.json_normalize(raw)
+            else:
+                raise ValueError("Unsupported file format")
+        finally:
+            os.remove(tmp_path)
+
+        logger.info("Loaded dataframe shape: %s", df.shape)
+
+        # -------- Split size handling --------
+        test_size = args.split_size / 100 if args.split_size >= 1 else args.split_size
+        if not 0 < test_size < 1:
+            raise ValueError("split_size must be between 0 and 1 or 1–99")
+
+        # -------- Train / Test Split --------
+        train_df, test_df = train_test_split(
+            df, test_size=test_size, random_state=42
+        )
+
+        train_df = train_df.reset_index(drop=True)
+        test_df = test_df.reset_index(drop=True)
+
+        # -------- Save outputs --------
+        os.makedirs(os.path.dirname(args.train_loader) or ".", exist_ok=True)
+        os.makedirs(os.path.dirname(args.test_loader) or ".", exist_ok=True)
+
+        train_df.to_parquet(args.train_loader, index=False)
+        test_df.to_parquet(args.test_loader, index=False)
+
+        logger.info("Saved train_loader: %s", train_df.shape)
+        logger.info("Saved test_loader: %s", test_df.shape)
+
+    args:
+      - --cdn_url
+      - {inputValue: cdn_url}
+      - --split_size
+      - {inputValue: split_size}
+      - --train_loader
+      - {outputPath: train_loader}
+      - --test_loader
+      - {outputPath: test_loader}
