@@ -1,4 +1,4 @@
-name: Time Series Preprocessing v2.1
+name: Time Series Preprocessing v3.0
 inputs:
   - {name: cleaned_data, type: Dataset, description: "Cleaned dataset from previous component"}
   - {name: cleaning_metadata, type: Data, description: "Metadata from cleaning component"}
@@ -152,37 +152,69 @@ implementation:
             raise ValueError(f'Failed to parse date column "{date_col}". Please check the date format.')
 
         def create_lag_features(df, columns, lag_periods):
+            # Filter to numeric columns only
             numeric_cols = [col for col in columns if col in df.columns and pd.api.types.is_numeric_dtype(df[col])]
             print('[INFO] Creating lag features for', len(numeric_cols), 'numeric columns with lags:', lag_periods)
-            print('[INFO] Numeric columns:', numeric_cols[:5], '...' if len(numeric_cols) > 5 else '')
+            if len(numeric_cols) > 0:
+                print('[INFO] Numeric columns:', numeric_cols[:5], '...' if len(numeric_cols) > 5 else '')
             
+            if not numeric_cols or not lag_periods:
+                return df
+            
+            # Create all lag features at once using concat for better performance
+            lag_features = {}
             for col in numeric_cols:
                 for lag in lag_periods:
-                    df[col + '_lag_' + str(lag)] = df[col].shift(lag)
+                    lag_features[col + '_lag_' + str(lag)] = df[col].shift(lag)
+            
+            if lag_features:
+                df = pd.concat([df, pd.DataFrame(lag_features, index=df.index)], axis=1)
+            
             return df
-        
+
         def create_rolling_features(df, columns, rolling_windows):
+            # Filter to numeric columns only
             numeric_cols = [col for col in columns if col in df.columns and pd.api.types.is_numeric_dtype(df[col])]
             print('[INFO] Creating rolling features for', len(numeric_cols), 'numeric columns with windows:', rolling_windows)
-            print('[INFO] Numeric columns:', numeric_cols[:5], '...' if len(numeric_cols) > 5 else '')
+            if len(numeric_cols) > 0:
+                print('[INFO] Numeric columns:', numeric_cols[:5], '...' if len(numeric_cols) > 5 else '')
             
+            if not numeric_cols or not rolling_windows:
+                return df
+            
+            # Create all rolling features at once using concat for better performance
+            rolling_features = {}
             for col in numeric_cols:
                 for window in rolling_windows:
-                    df[col + '_rolling_mean_' + str(window)] = df[col].rolling(window).mean()
-                    df[col + '_rolling_std_' + str(window)] = df[col].rolling(window).std()
-                    df[col + '_rolling_min_' + str(window)] = df[col].rolling(window).min()
-                    df[col + '_rolling_max_' + str(window)] = df[col].rolling(window).max()
+                    rolling_features[col + '_rolling_mean_' + str(window)] = df[col].rolling(window).mean()
+                    rolling_features[col + '_rolling_std_' + str(window)] = df[col].rolling(window).std()
+                    rolling_features[col + '_rolling_min_' + str(window)] = df[col].rolling(window).min()
+                    rolling_features[col + '_rolling_max_' + str(window)] = df[col].rolling(window).max()
+            
+            if rolling_features:
+                df = pd.concat([df, pd.DataFrame(rolling_features, index=df.index)], axis=1)
+            
             return df
-        
+
         def create_diff_features(df, columns):
             # Filter to numeric columns only
             numeric_cols = [col for col in columns if col in df.columns and pd.api.types.is_numeric_dtype(df[col])]
             print('[INFO] Creating difference features for', len(numeric_cols), 'numeric columns')
-            print('[INFO] Numeric columns:', numeric_cols[:5], '...' if len(numeric_cols) > 5 else '')
+            if len(numeric_cols) > 0:
+                print('[INFO] Numeric columns:', numeric_cols[:5], '...' if len(numeric_cols) > 5 else '')
             
+            if not numeric_cols:
+                return df
+            
+            # Create all diff features at once using concat for better performance
+            diff_features = {}
             for col in numeric_cols:
-                df[col + '_diff'] = df[col].diff()
-                df[col + '_pct_change'] = df[col].pct_change()
+                diff_features[col + '_diff'] = df[col].diff()
+                diff_features[col + '_pct_change'] = df[col].pct_change()
+            
+            if diff_features:
+                df = pd.concat([df, pd.DataFrame(diff_features, index=df.index)], axis=1)
+            
             return df
 
         def encode_categorical_safe(df, exclude_cols=None):
@@ -292,13 +324,14 @@ implementation:
                     df[self.date_column] = parse_date_column(df, self.date_column)
                     df = df.sort_values(by=self.date_column).reset_index(drop=True)
                 
-                if self.create_lags and self.lag_periods:
+                # Check boolean flags properly (they are stored as booleans, not callables)
+                if self.create_lags is True and self.lag_periods:
                     df = create_lag_features(df, self.feature_columns, self.lag_periods)
                 
-                if self.create_rolling_stats and self.rolling_windows:
+                if self.create_rolling_stats is True and self.rolling_windows:
                     df = create_rolling_features(df, self.feature_columns, self.rolling_windows)
                 
-                if self.create_diff_features:
+                if self.create_diff_features is True:
                     df = create_diff_features(df, self.feature_columns)
                 
                 df = df.bfill().ffill()
