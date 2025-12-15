@@ -19,7 +19,7 @@ outputs:
   - {name: engineering_metadata, type: Data, description: "JSON metadata with preprocessing statistics"}
 implementation:
   container:
-    image: kumar2004/ml-base:v1
+    image: gurpreetgandhi/nesy-factory:v25
     command:
       - python3
       - -u
