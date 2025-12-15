@@ -7,7 +7,7 @@ outputs:
   - {name: test_loader, type: Dataset}
 implementation:
   container:
-    image: kumar2004/ml-base:v1
+    image: gurpreetgandhi/nesy-factory:v25
     command:
       - python3
       - -u
