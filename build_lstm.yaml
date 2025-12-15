@@ -1,0 +1,57 @@
+name: Initialize LSTM Model
+description: Initializes the LSTM model.
+inputs:
+  - {name: config, type: String}
+outputs:
+  - {name: model, type: Model}
+implementation:
+  container:
+    image: gurpreetgandhi/nesy-factory:v25
+    command:
+      - sh
+      - -c
+      - |
+        exec "$0" "$@"
+      - python3
+      - -u
+      - -c
+      - |
+        import argparse
+        import json
+        import os
+        import sys
+        import torch
+
+        from nesy_factory.RNNs import LSTM
+
+        parser = argparse.ArgumentParser()
+        parser.add_argument('--config', type=str, required=True)
+        parser.add_argument('--model', type=str, required=True)
+        args = parser.parse_args()
+
+        config = json.loads(args.config)
+
+        model_config = {
+            'input_dim': len(config['feature_columns']),
+            'hidden_dim': config['hidden_dim'],
+            'output_dim': 1,
+            'num_layers': config['num_layers'],
+            'dropout': config['dropout'],
+            'optimizer': 'adam',
+            'learning_rate': config['learning_rate'],
+            'epochs': config['epochs'],
+            'loss_function': config['loss_function']
+        }
+
+        model_obj = LSTM(model_config)
+
+        os.makedirs(os.path.dirname(args.model), exist_ok=True)
+
+        torch.save(model_obj, args.model)
+
+        print(f"Saved LSTM model to {args.model}")
+    args:
+      - --config
+      - {inputValue: config}
+      - --model
+      - {outputPath: model}
