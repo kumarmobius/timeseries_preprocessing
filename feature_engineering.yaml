@@ -1,4 +1,4 @@
-name: Time Series Preprocessing v3.2
+name: Time Series Preprocessing v3.3
 inputs:
   - {name: cleaned_data, type: Dataset, description: "Cleaned dataset from previous component"}
   - {name: cleaning_metadata, type: Data, description: "Metadata from cleaning component"}
@@ -468,14 +468,22 @@ implementation:
             print('[INFO] Shape after feature engineering:', df.shape)
             print('[INFO] Created', df.shape[1] - initial_shape[1], 'new features')
             
-            print('[STEP 7/13] Handling missing values (backward-fill then forward-fill)...')
+            print('[STEP 7/13] Handling missing values and infinity values...')
             nan_before = df.isna().sum().sum()
+            
+            # Replace infinity values with NaN
+            df = df.replace([np.inf, -np.inf], np.nan)
+            inf_count = df.isna().sum().sum() - nan_before
+            if inf_count > 0:
+                print('[INFO] Replaced', inf_count, 'infinity values with NaN')
+            
+            # Backward-fill then forward-fill
             df = df.bfill()
             df = df.ffill()
             df = df.dropna()
             nan_after = df.isna().sum().sum()
             print('[INFO] NaN values:', nan_before, '->', nan_after)
-            print('[INFO] Shape after dropping NaN:', df.shape)
+            print('[INFO] Shape after cleaning:', df.shape)
             
             print('[STEP 8/13] Encoding categorical features...')
             exclude_cols = [args.target_column]
