@@ -1,4 +1,4 @@
-name: Train LSTM Model v2.1
+name: Train LSTM Model v2.3
 description: Trains LSTM model on preprocessed time series data
 inputs:
   - {name: model, type: Model, description: "Initialized LSTM model"}
@@ -26,6 +26,7 @@ implementation:
         import torch
         import torch.nn as nn
         import torch.optim as optim
+        import cloudpickle
 
         def ensure_dir_for(p):
             d = os.path.dirname(p)
@@ -59,7 +60,7 @@ implementation:
             
             print('[STEP 3/6] Loading processed data...')
             with open(args.processed_data, 'rb') as f:
-                data_wrapper = pickle.load(f)
+                data_wrapper = cloudpickle.load(f)
             
             train_loader = data_wrapper.train_loader
             test_loader = data_wrapper.test_loader
@@ -114,10 +115,8 @@ implementation:
             print('[INFO] Best loss:', round(best_loss, 6))
             
             print('[STEP 6/6] Saving outputs...')
-            
             ensure_dir_for(args.trained_model)
-            with open(args.trained_model, 'wb') as f:
-                pickle.dump(model_obj.cpu(), f)
+            torch.save(model_obj.cpu(), args.trained_model)
             print('[INFO] Saved trained model to:', args.trained_model)
             
             training_metrics = {
