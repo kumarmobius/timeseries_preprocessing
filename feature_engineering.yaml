@@ -1,4 +1,4 @@
-name: Time Series Preprocessing v3.0
+name: Time Series Preprocessing v3.2
 inputs:
   - {name: cleaned_data, type: Dataset, description: "Cleaned dataset from previous component"}
   - {name: cleaning_metadata, type: Data, description: "Metadata from cleaning component"}
@@ -399,12 +399,13 @@ implementation:
 
         try:
             print("="*80)
-            print("TIME SERIES PREPROCESSING v2.0 (AUTO DATE DETECTION)")
+            print("TIME SERIES PREPROCESSING v3.1 (AUTO DATE DETECTION)")
             print("="*80)
             
-            create_lags = args.create_lags.lower() in ('true', 't', 'yes', 'y', '1')
-            create_rolling_stats = args.create_rolling_stats.lower() in ('true', 't', 'yes', 'y', '1')
-            create_diff_features = args.create_diff_features.lower() in ('true', 't', 'yes', 'y', '1')
+            # FIXED: Renamed variables to avoid shadowing function names
+            enable_lags = args.create_lags.lower() in ('true', 't', 'yes', 'y', '1')
+            enable_rolling_stats = args.create_rolling_stats.lower() in ('true', 't', 'yes', 'y', '1')
+            enable_diff_features = args.create_diff_features.lower() in ('true', 't', 'yes', 'y', '1')
             
             lag_periods = parse_comma_separated(args.lag_periods, int)
             rolling_windows = parse_comma_separated(args.rolling_windows, int)
@@ -454,13 +455,14 @@ implementation:
             print('[STEP 6/13] Creating time series features...')
             initial_shape = df.shape
             
-            if create_lags and lag_periods:
+            # FIXED: Using renamed variables instead of function names
+            if enable_lags and lag_periods:
                 df = create_lag_features(df, feature_cols, lag_periods)
             
-            if create_rolling_stats and rolling_windows:
+            if enable_rolling_stats and rolling_windows:
                 df = create_rolling_features(df, feature_cols, rolling_windows)
             
-            if create_diff_features:
+            if enable_diff_features:
                 df = create_diff_features(df, feature_cols)
             
             print('[INFO] Shape after feature engineering:', df.shape)
@@ -566,9 +568,9 @@ implementation:
                 'seq_length': args.seq_length,
                 'lag_periods': lag_periods,
                 'rolling_windows': rolling_windows,
-                'create_lags': create_lags,
-                'create_rolling_stats': create_rolling_stats,
-                'create_diff_features': create_diff_features,
+                'create_lags': enable_lags,
+                'create_rolling_stats': enable_rolling_stats,
+                'create_diff_features': enable_diff_features,
                 'unique_threshold': args.unique_threshold
             })
             preprocessor.scaler = scaler
@@ -592,9 +594,9 @@ implementation:
                 'unique_threshold': args.unique_threshold,
                 'lag_periods': lag_periods,
                 'rolling_windows': rolling_windows,
-                'create_lags': create_lags,
-                'create_rolling_stats': create_rolling_stats,
-                'create_diff_features': create_diff_features,
+                'create_lags': enable_lags,
+                'create_rolling_stats': enable_rolling_stats,
+                'create_diff_features': enable_diff_features,
                 'shapes': {
                     'X_train': list(X_train.shape),
                     'y_train': list(y_train.shape),
@@ -612,9 +614,9 @@ implementation:
                 'dropped_unique_columns': dropped_unique_cols,
                 'uniqueness_report': uniqueness_report,
                 'features_created': {
-                    'lag_features': len(lag_periods) * len(feature_cols) if create_lags else 0,
-                    'rolling_features': len(rolling_windows) * 4 * len(feature_cols) if create_rolling_stats else 0,
-                    'diff_features': 2 * len(feature_cols) if create_diff_features else 0
+                    'lag_features': len(lag_periods) * len(feature_cols) if enable_lags else 0,
+                    'rolling_features': len(rolling_windows) * 4 * len(feature_cols) if enable_rolling_stats else 0,
+                    'diff_features': 2 * len(feature_cols) if enable_diff_features else 0
                 },
                 'categorical_encodings': encoding_info,
                 'cleaning_metadata': cleaning_meta
