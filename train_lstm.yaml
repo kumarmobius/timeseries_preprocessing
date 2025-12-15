@@ -1,4 +1,4 @@
-name: Train LSTM Model v2.1
+name: Train LSTM Model v2.2
 description: Trains LSTM model on preprocessed time series data
 inputs:
   - {name: model, type: Model, description: "Initialized LSTM model"}
@@ -53,7 +53,8 @@ implementation:
             print('[INFO] Learning rate:', learning_rate)
             
             print('[STEP 2/6] Loading model...')
-            model_obj = torch.load(args.model, map_location='cpu')
+            with open(args.model, 'rb') as f:
+                model_obj = pickle.load(f)
             print('[INFO] Model loaded successfully')
             print('[INFO] Model type:', type(model_obj).__name__)
             
