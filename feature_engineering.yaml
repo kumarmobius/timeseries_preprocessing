@@ -1,4 +1,4 @@
-name: Time Series Preprocessing v4
+name: Time Series Preprocessing v4.1
 inputs:
   - {name: cleaned_data, type: Dataset, description: "Cleaned dataset from previous component"}
   - {name: cleaning_metadata, type: Data, description: "Metadata from cleaning component"}
@@ -567,7 +567,7 @@ implementation:
             
             ensure_dir_for(args.processed_data)
             with open(args.processed_data, 'wb') as f:
-                pickle.dump(data_wrapper, f)
+                cloudpickle.dump(data_wrapper, f)
             print('[INFO] Saved processed_data to:', args.processed_data)
             
             preprocessor = TimeSeriesPreprocessor()
