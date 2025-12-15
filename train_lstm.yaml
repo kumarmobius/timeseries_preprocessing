@@ -1,0 +1,166 @@
+name: Train LSTM Model v2.0
+description: Trains LSTM model on preprocessed time series data
+inputs:
+  - {name: model, type: Model, description: "Initialized LSTM model"}
+  - {name: processed_data, type: Dataset, description: "DataWrapper containing train and test loaders"}
+  - {name: config, type: String, description: "Training configuration JSON"}
+outputs:
+  - {name: trained_model, type: Model, description: "Trained LSTM model"}
+  - {name: training_metrics, type: Data, description: "Training metrics and loss history"}
+implementation:
+  container:
+    image: kumar2004/ml-base:v1
+    command:
+      - python3
+      - -u
+      - -c
+      - |
+        import argparse
+        import json
+        import os
+        import pickle
+        import sys
+        import traceback
+        from datetime import datetime
+        import torch
+        import torch.nn as nn
+        import torch.optim as optim
+
+        def ensure_dir_for(p):
+            d = os.path.dirname(p)
+            if d and not os.path.exists(d):
+                os.makedirs(d, exist_ok=True)
+
+        parser = argparse.ArgumentParser()
+        parser.add_argument('--model', type=str, required=True)
+        parser.add_argument('--processed_data', type=str, required=True)
+        parser.add_argument('--config', type=str, required=True)
+        parser.add_argument('--trained_model', type=str, required=True)
+        parser.add_argument('--training_metrics', type=str, required=True)
+        args = parser.parse_args()
+
+        try:
+            print('='*80)
+            print('LSTM MODEL TRAINING')
+            print('='*80)
+            
+            print('[STEP 1/6] Loading configuration...')
+            config = json.loads(args.config)
+            epochs = config.get('epochs', 10)
+            learning_rate = config.get('learning_rate', 0.001)
+            print('[INFO] Epochs:', epochs)
+            print('[INFO] Learning rate:', learning_rate)
+            
+            print('[STEP 2/6] Loading model...')
+            with open(args.model, 'rb') as f:
+                model_obj = pickle.load(f)
+            print('[INFO] Model loaded successfully')
+            print('[INFO] Model type:', type(model_obj).__name__)
+            
+            print('[STEP 3/6] Loading processed data...')
+            with open(args.processed_data, 'rb') as f:
+                data_wrapper = pickle.load(f)
+            
+            train_loader = data_wrapper.train_loader
+            test_loader = data_wrapper.test_loader
+            input_dim = data_wrapper.input_dim
+            
+            print('[INFO] Train loader batches:', len(train_loader))
+            print('[INFO] Test loader batches:', len(test_loader))
+            print('[INFO] Input dimension:', input_dim)
+            
+            print('[STEP 4/6] Setting up training...')
+            device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+            print('[INFO] Using device:', device)
+            
+            model_obj = model_obj.to(device)
+            criterion = nn.MSELoss()
+            optimizer = optim.Adam(model_obj.parameters(), lr=learning_rate)
+            
+            print('[STEP 5/6] Training model...')
+            epoch_losses = []
+            best_loss = float('inf')
+            
+            for epoch in range(epochs):
+                model_obj.train()
+                total_train_loss = 0
+                batch_count = 0
+                
+                for inputs, labels in train_loader:
+                    inputs = inputs.to(device)
+                    labels = labels.to(device)
+                    
+                    optimizer.zero_grad()
+                    outputs = model_obj(inputs)
+                    loss = criterion(outputs, labels)
+                    loss.backward()
+                    optimizer.step()
+                    
+                    total_train_loss += loss.item()
+                    batch_count += 1
+                
+                avg_epoch_loss = total_train_loss / batch_count
+                epoch_losses.append({
+                    'epoch': epoch + 1,
+                    'train_loss': float(avg_epoch_loss)
+                })
+                
+                if avg_epoch_loss < best_loss:
+                    best_loss = avg_epoch_loss
+                
+                print('[Epoch ' + str(epoch + 1) + '/' + str(epochs) + '] Train Loss: ' + str(round(avg_epoch_loss, 6)))
+            
+            print('[INFO] Training completed')
+            print('[INFO] Best loss:', round(best_loss, 6))
+            
+            print('[STEP 6/6] Saving outputs...')
+            
+            ensure_dir_for(args.trained_model)
+            with open(args.trained_model, 'wb') as f:
+                pickle.dump(model_obj.cpu(), f)
+            print('[INFO] Saved trained model to:', args.trained_model)
+            
+            training_metrics = {
+                'timestamp': datetime.utcnow().isoformat() + 'Z',
+                'epochs': epochs,
+                'learning_rate': learning_rate,
+                'best_loss': float(best_loss),
+                'final_loss': float(epoch_losses[-1]['train_loss']),
+                'epoch_losses': epoch_losses,
+                'device': str(device),
+                'input_dim': input_dim,
+                'train_batches': len(train_loader),
+                'test_batches': len(test_loader),
+                'model_type': type(model_obj).__name__,
+                'config': config
+            }
+            
+            ensure_dir_for(args.training_metrics)
+            with open(args.training_metrics, 'w') as f:
+                json.dump(training_metrics, f, indent=2)
+            print('[INFO] Saved training metrics to:', args.training_metrics)
+            
+            print('='*80)
+            print('TRAINING COMPLETE')
+            print('='*80)
+            print('Total epochs:', epochs)
+            print('Best loss:', round(best_loss, 6))
+            print('Final loss:', round(epoch_losses[-1]['train_loss'], 6))
+            print('Model saved to:', args.trained_model)
+            print('='*80)
+            
+        except Exception as exc:
+            print('ERROR:', str(exc), file=sys.stderr)
+            traceback.print_exc()
+            sys.exit(1)
+    args:
+      - --model
+      - {inputPath: model}
+      - --processed_data
+      - {inputPath: processed_data}
+      - --config
+      - {inputValue: config}
+      - --trained_model
+      - {outputPath: trained_model}
+      - --training_metrics
+      - {outputPath: training_metrics}
