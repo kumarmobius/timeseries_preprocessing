@@ -1,4 +1,4 @@
-name: Time Series Preprocessing v6.2
+name: Time Series Preprocessing v6.3
 inputs:
   - {name: cleaned_data, type: Dataset}
   - {name: cleaning_metadata, type: Data}
@@ -329,6 +329,19 @@ implementation:
                 
                 # Get feature columns
                 ff=[c for c in df.columns if c not in ex]
+                
+                # Additional check: ensure all feature columns are numeric
+                non_numeric = []
+                for col in ff:
+                    if col in df.columns and not pd.api.types.is_numeric_dtype(df[col]):
+                        non_numeric.append(col)
+                        print(f'[CLEAN] Removing non-numeric column: {col} (type: {df[col].dtype})')
+                
+                if non_numeric:
+                    ff = [c for c in ff if c not in non_numeric]
+                    df = df.drop(columns=non_numeric)
+                
+                print(f'[FEATURES] Selected {len(ff)} numeric features')
                 
                 # Handle uniqueness
                 if tm:
