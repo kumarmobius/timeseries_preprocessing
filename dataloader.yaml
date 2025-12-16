@@ -1,10 +1,12 @@
-name: Data splitter v1.0
+name: Data Splitter v2.0
+description: Reads data from file and splits into train/test sets with multiple format support
 inputs:
-  - {name: json_data, type: Dataset, description: 'Complete JSON data as string'}
-  - {name: split_size, type: Integer, default: "15", description: 'Test split size as integer percent (default 15) or fraction (e.g. 0.2)'}
+  - {name: input_data, type: Dataset, description: 'Input data file (JSON/CSV/Parquet supported)'}
+  - {name: test_split, type: Float, default: "0.15", description: 'Test split ratio (0.0-1.0, e.g., 0.15 = 15%)'}
+  - {name: random_seed, type: Integer, default: "42", description: 'Random seed for reproducibility'}
 outputs:
-  - {name: train_loader, type: Dataset}
-  - {name: test_loader, type: Dataset}
+  - {name: train_data, type: Dataset, description: 'Training dataset in Parquet format'}
+  - {name: test_data, type: Dataset, description: 'Test dataset in Parquet format'}
 implementation:
   container:
     image: gurpreetgandhi/nesy-factory:v25
@@ -16,115 +18,240 @@ implementation:
         import argparse
         import os
         import sys
-        import logging
         import json
+        import logging
         import pandas as pd
         from sklearn.model_selection import train_test_split
 
-        # --------- CLI ----------
-        parser = argparse.ArgumentParser()
-        parser.add_argument('--json_data', type=str, required=True)
-        parser.add_argument('--split_size', type=float, default=15)
-        parser.add_argument('--train_loader', type=str, required=True)
-        parser.add_argument('--test_loader', type=str, required=True)
-        args = parser.parse_args()
-
-        # --------- Logging ----------
-        logging.basicConfig(stream=sys.stdout, level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+        # Setup logging
+        logging.basicConfig(stream=sys.stdout, level=logging.INFO, 
+                          format="%(asctime)s [%(levelname)s] %(message)s")
         logger = logging.getLogger("data_splitter")
 
-        logger.info("Starting data splitting process")
+        def ensure_dir(path):
+            d = os.path.dirname(path)
+            if d: os.makedirs(d, exist_ok=True)
 
-        # --------- Parse JSON data ----------
+        def read_data_file(file_path):
+            logger.info("="*80)
+            logger.info("READING INPUT FILE")
+            logger.info("="*80)
+            logger.info("File path: %s", file_path)
+            
+            if not os.path.exists(file_path):
+                raise FileNotFoundError(f"File not found: {file_path}")
+            
+            file_size = os.path.getsize(file_path)
+            logger.info("File size: %d bytes (%.2f MB)", file_size, file_size/1024/1024)
+            
+            _, ext = os.path.splitext(file_path)
+            ext = ext.lower()
+            logger.info("File extension: %s", ext)
+            
+            # Try Parquet first (most common in Kubeflow)
+            if ext in ['.parquet', '.pq']:
+                try:
+                    df = pd.read_parquet(file_path)
+                    logger.info("Successfully read as Parquet: %s", df.shape)
+                    return df
+                except Exception as e:
+                    logger.warning("Parquet read failed: %s", e)
+            
+            # Try JSON
+            if ext in ['.json', '.jsonl']:
+                try:
+                    # Method 1: Read file and parse JSON
+                    with open(file_path, 'r', encoding='utf-8') as f:
+                        data = json.load(f)
+                    logger.info("Successfully loaded JSON")
+                    
+                    # Handle nested structures
+                    if isinstance(data, dict):
+                        for key in ('data', 'items', 'results', 'records', 'rows'):
+                            if key in data and isinstance(data[key], (list, dict)):
+                                logger.info("Extracting nested data from key: %s", key)
+                                data = data[key]
+                                break
+                    
+                    # Normalize to DataFrame
+                    if isinstance(data, list):
+                        df = pd.json_normalize(data)
+                    elif isinstance(data, dict):
+                        df = pd.json_normalize([data])
+                    else:
+                        raise ValueError("Unexpected JSON structure")
+                    
+                    logger.info("Converted to DataFrame: %s", df.shape)
+                    return df
+                    
+                except json.JSONDecodeError:
+                    # Try JSON Lines format
+                    try:
+                        df = pd.read_json(file_path, lines=True)
+                        logger.info("Successfully read as JSON Lines: %s", df.shape)
+                        return df
+                    except Exception as e2:
+                        logger.warning("JSON Lines read failed: %s", e2)
+                except Exception as e:
+                    logger.warning("JSON read failed: %s", e)
+            
+            # Try CSV
+            if ext in ['.csv', '.txt']:
+                try:
+                    df = pd.read_csv(file_path)
+                    logger.info("Successfully read as CSV: %s", df.shape)
+                    return df
+                except Exception as e:
+                    logger.warning("CSV read failed: %s", e)
+                    # Try with different delimiter
+                    try:
+                        df = pd.read_csv(file_path, sep=';')
+                        logger.info("Successfully read as CSV (semicolon): %s", df.shape)
+                        return df
+                    except:
+                        pass
+            
+            # Try TSV
+            if ext in ['.tsv']:
+                try:
+                    df = pd.read_csv(file_path, sep='\t')
+                    logger.info("Successfully read as TSV: %s", df.shape)
+                    return df
+                except Exception as e:
+                    logger.warning("TSV read failed: %s", e)
+            
+            # Last resort: try all formats without checking extension
+            logger.info("Attempting auto-detection...")
+            
+            for fmt, reader in [
+                ('Parquet', lambda: pd.read_parquet(file_path)),
+                ('CSV', lambda: pd.read_csv(file_path)),
+                ('JSON', lambda: pd.read_json(file_path)),
+                ('JSON Lines', lambda: pd.read_json(file_path, lines=True))
+            ]:
+                try:
+                    df = reader()
+                    logger.info("Auto-detected as %s: %s", fmt, df.shape)
+                    return df
+                except:
+                    continue
+            
+            raise ValueError(f"Could not read file. Supported: JSON, CSV, TSV, Parquet")
+
+        # Parse arguments
+        parser = argparse.ArgumentParser()
+        parser.add_argument('--input_data', type=str, required=True)
+        parser.add_argument('--test_split', type=float, default=0.15)
+        parser.add_argument('--random_seed', type=int, default=42)
+        parser.add_argument('--train_data', type=str, required=True)
+        parser.add_argument('--test_data', type=str, required=True)
+        args = parser.parse_args()
+
         try:
-            raw = json.loads(args.json_data)
-            logger.info("Successfully parsed JSON data")
-        except json.JSONDecodeError as e:
-            logger.exception("Failed to parse JSON data: %s", e)
-            raise ValueError("Invalid JSON data provided")
-
-        # Handle nested JSON structures
-        if isinstance(raw, dict):
-            for key in ("data", "items", "results", "records"):
-                if key in raw and isinstance(raw[key], (list, dict)):
-                    raw = raw[key]
-                    logger.info("Extracted nested data from key: %s", key)
-                    break
-        
-        # Normalize to DataFrame
-        try:
-            if isinstance(raw, list):
-                df = pd.json_normalize(raw)
-            else:
-                df = pd.json_normalize([raw])
-            logger.info("Successfully created DataFrame from JSON")
-        except Exception as e:
-            logger.exception("Failed to normalize JSON to DataFrame: %s", e)
-            raise
-
-        # === FULL DATAFRAME DIAGNOSTICS ===
-        logger.info("===== FULL DATAFRAME SUMMARY =====")
-        logger.info("Shape: %s", df.shape)
-        logger.info("Columns: %s", df.columns.tolist())
-        logger.info("DF_HEAD:%s", df.head().to_string())
-        logger.info("DF_DTYPES:%s", df.dtypes.to_string())
-        logger.info("DF_NULL_COUNTS:%s", df.isnull().sum().to_string())
-
-        # === Convert split size ===
-        split_size_input = float(args.split_size)
-        test_size = split_size_input / 100.0 if split_size_input >= 1.0 else split_size_input
-        if not (0.0 < test_size < 1.0):
-            raise ValueError("split_size must be between 0 and 1 or 1–99 (as percent)")
-
-        logger.info("Using test split size: %.2f", test_size)
-
-        # === Perform train-test split ===
-        try:
+            logger.info("="*80)
+            logger.info("DATA SPLITTER v2.0")
+            logger.info("="*80)
+            
+            # Step 1: Read input data
+            df = read_data_file(args.input_data)
+            
+            # Step 2: Validate data
+            logger.info("="*80)
+            logger.info("DATA VALIDATION")
+            logger.info("="*80)
+            logger.info("Shape: %s", df.shape)
+            logger.info("Columns: %s", df.columns.tolist()[:10])
+            logger.info("Memory usage: %.2f MB", df.memory_usage(deep=True).sum()/1024/1024)
+            
+            # Check for issues
+            null_counts = df.isnull().sum()
+            null_cols = null_counts[null_counts > 0]
+            if len(null_cols) > 0:
+                logger.warning("Columns with nulls: %d", len(null_cols))
+                for col, count in null_cols.head(5).items():
+                    logger.warning("  %s: %d (%.1f%%)", col, count, count/len(df)*100)
+            
+            n_dupes = df.duplicated().sum()
+            if n_dupes > 0:
+                logger.warning("Duplicate rows: %d (%.1f%%)", n_dupes, n_dupes/len(df)*100)
+            
+            logger.info("Sample data:")
+            logger.info("\n%s", df.head(3).to_string())
+            
+            # Step 3: Validate test_split
+            test_size = args.test_split
+            if test_size >= 1.0:
+                # If >= 1, treat as percentage
+                test_size = test_size / 100.0
+                logger.info("Converted test_split from %.0f%% to %.2f", args.test_split, test_size)
+            
+            if not 0.0 < test_size < 1.0:
+                raise ValueError(f"test_split must be between 0 and 1, got: {test_size}")
+            
+            # Step 4: Perform split
+            logger.info("="*80)
+            logger.info("SPLITTING DATA")
+            logger.info("="*80)
+            logger.info("Test split ratio: %.2f (%.1f%%)", test_size, test_size*100)
+            logger.info("Random seed: %d", args.random_seed)
+            
             train_df, test_df = train_test_split(
-                df, test_size=test_size, random_state=42
+                df, 
+                test_size=test_size
             )
-            logger.info("Successfully split data into train and test sets")
+            
+            # Reset indices
+            train_df = train_df.reset_index(drop=True)
+            test_df = test_df.reset_index(drop=True)
+            
+            logger.info("Train set: %d rows (%.1f%%)", len(train_df), len(train_df)/len(df)*100)
+            logger.info("Test set: %d rows (%.1f%%)", len(test_df), len(test_df)/len(df)*100)
+            
+            # Step 5: Save outputs
+            logger.info("="*80)
+            logger.info("SAVING OUTPUTS")
+            logger.info("="*80)
+            
+            def safe_save(df_obj, path, name):
+                ensure_dir(path)
+                try:
+                    df_obj.to_parquet(path, index=False, engine='pyarrow')
+                    size = os.path.getsize(path)
+                    logger.info("Saved %s as Parquet: %s (%.2f MB)", name, path, size/1024/1024)
+                except Exception as e:
+                    logger.error("Parquet save failed: %s", e)
+                    csv_path = path + ".csv"
+                    logger.info("Falling back to CSV: %s", csv_path)
+                    df_obj.to_csv(csv_path, index=False)
+                    size = os.path.getsize(csv_path)
+                    logger.info("Saved %s as CSV: %s (%.2f MB)", name, csv_path, size/1024/1024)
+            
+            safe_save(train_df, args.train_data, "train_data")
+            safe_save(test_df, args.test_data, "test_data")
+            
+            # Summary
+            logger.info("="*80)
+            logger.info("SUCCESS")
+            logger.info("="*80)
+            logger.info("Input: %s -> %d rows", args.input_data, len(df))
+            logger.info("Train: %s -> %d rows", args.train_data, len(train_df))
+            logger.info("Test: %s -> %d rows", args.test_data, len(test_df))
+            logger.info("="*80)
+            
         except Exception as e:
-            logger.exception("Failed to split data: %s", e)
-            raise
-
-        # Reset indices
-        train_df = train_df.reset_index(drop=True)
-        test_df = test_df.reset_index(drop=True)
-
-        # === Diagnostics for splits ===
-        logger.info("===== TRAIN LOADER =====")
-        logger.info("Shape: %s", train_df.shape)
-        logger.info("Rows: %d (%.1f%%)", len(train_df), (len(train_df) / len(df)) * 100)
-        logger.info("%s", train_df.head(3).to_string())
-
-        logger.info("===== TEST LOADER =====")
-        logger.info("Shape: %s", test_df.shape)
-        logger.info("Rows: %d (%.1f%%)", len(test_df), (len(test_df) / len(df)) * 100)
-        logger.info("%s", test_df.head(3).to_string())
-
-        # === Save Parquet Outputs ===
-        def safe_to_parquet(df_obj, path):
-            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-            try:
-                df_obj.to_parquet(path, index=False)
-                logger.info("Successfully saved parquet to %s", path)
-            except Exception as e:
-                logger.exception("Failed to write parquet to %s: %s", path, e)
-                csv_path = path + ".csv"
-                logger.info("Falling back to CSV at %s", csv_path)
-                df_obj.to_csv(csv_path, index=False)
-
-        safe_to_parquet(train_df, args.train_loader)
-        safe_to_parquet(test_df, args.test_loader)
-
-        logger.info("Finished processing and saved outputs.")
+            logger.error("="*80)
+            logger.error("ERROR")
+            logger.error("="*80)
+            logger.exception("Failed to process data: %s", e)
+            sys.exit(1)
     args:
-      - --json_data
-      - {inputValue: json_data}
-      - --split_size
-      - {inputValue: split_size}
-      - --train_loader
-      - {outputPath: train_loader}
-      - --test_loader
-      - {outputPath: test_loader}
+      - --input_data
+      - {inputPath: input_data}
+      - --test_split
+      - {inputValue: test_split}
+      - --random_seed
+      - {inputValue: random_seed}
+      - --train_data
+      - {outputPath: train_data}
+      - --test_data
+      - {outputPath: test_data}
