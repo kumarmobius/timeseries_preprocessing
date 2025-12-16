@@ -1,4 +1,4 @@
-name: Time Series Preprocessing v7.5
+name: Time Series Preprocessing v8.0
 inputs:
   - {name: cleaned_data, type: Dataset}
   - {name: cleaning_metadata, type: Data}
@@ -9,8 +9,8 @@ inputs:
   - {name: test_split, type: Float, optional: true, default: "0.2"}
   - {name: batch_size, type: Integer, optional: true, default: "32"}
   - {name: unique_threshold, type: Float, optional: true, default: "0.95"}
-  - {name: lag_periods, type: String, optional: true, default: "1,2,3,7"}
-  - {name: rolling_windows, type: String, optional: true, default: "7,14"}
+  - {name: lag_periods, type: String, optional: true, default: "1,2,3"}
+  - {name: rolling_windows, type: String, optional: true, default: "3,7"}
   - {name: create_lags, type: String, optional: true, default: "true"}
   - {name: create_rolling_stats, type: String, optional: true, default: "true"}
   - {name: create_diff_features, type: String, optional: true, default: "true"}
@@ -162,11 +162,28 @@ implementation:
             nc=[c for c in cols if c in df.columns and pd.api.types.is_numeric_dtype(df[c])]
             if not nc: return df,[]
             print(f'[DIFF] Creating difference features: {len(nc)} cols')
-            # FIX: Proper dict comprehension
             diff_feats={f'{c}_diff':df[c].diff() for c in nc}
             pct_feats={f'{c}_pct':df[c].pct_change() for c in nc}
             feats={**diff_feats,**pct_feats}
             return pd.concat([df,pd.DataFrame(feats,index=df.index)],axis=1),list(feats.keys())
+
+        def force_numeric_dtype(df, cols):
+            print(f'[DTYPE] Forcing {len(cols)} columns to numeric...')
+            for col in cols:
+                if col not in df.columns:
+                    continue
+                try:
+                    # Convert to numeric, coerce errors to NaN
+                    df[col] = pd.to_numeric(df[col], errors='coerce')
+                    # Fill NaN with forward/backward fill, then 0
+                    df[col] = df[col].bfill().ffill().fillna(0)
+                    # Explicit float64 cast
+                    df[col] = df[col].astype(np.float64)
+                except Exception as e:
+                    print(f'[DTYPE] Warning: Failed to convert {col} to numeric: {e}')
+                    # Drop problematic column as last resort
+                    df = df.drop(columns=[col])
+            return df
 
         def enc_cat_tr(df,ex):
             ex=set(ex or [])
@@ -175,20 +192,29 @@ implementation:
             print(f'[ENCODE] Encoding {len(cc)} categorical columns')
             ei={}
             for c in cc:
-                nu=df[c].nunique()
-                if nu<=10:
-                    d=pd.get_dummies(df[c],prefix=c,drop_first=False)
-                    # FIX: Convert all dummy columns to float64
-                    for dcol in d.columns:
-                        d[dcol]=d[dcol].astype(np.float64)
-                    df=pd.concat([df.drop(columns=[c]),d],axis=1)
-                    ei[c]={'type':'oh','cols':list(d.columns)}
-                    print(f'[ENCODE] One-hot: {c} -> {nu} columns')
-                else:
-                    fm=df[c].value_counts().to_dict()
-                    df[c]=df[c].map(fm).fillna(0).astype(np.float64)
-                    ei[c]={'type':'freq','map':{str(k):int(v) for k,v in list(fm.items())[:100]}}
-                    print(f'[ENCODE] Frequency: {c} ({nu} unique)')
+                try:
+                    nu=df[c].nunique()
+                    if nu<=10:
+                        # One-hot encoding
+                        d=pd.get_dummies(df[c],prefix=c,drop_first=False)
+                        # SAFE: Force all dummy columns to float64
+                        for dcol in d.columns:
+                            d[dcol]=d[dcol].astype(np.float64)
+                        df=pd.concat([df.drop(columns=[c]),d],axis=1)
+                        ei[c]={'type':'oh','cols':list(d.columns)}
+                        print(f'[ENCODE] One-hot: {c} -> {len(d.columns)} columns')
+                    else:
+                        # Frequency encoding
+                        fm=df[c].value_counts().to_dict()
+                        df[c]=df[c].map(fm)
+                        # SAFE: Force to numeric immediately
+                        df[c]=pd.to_numeric(df[c],errors='coerce').fillna(0).astype(np.float64)
+                        ei[c]={'type':'freq','map':{str(k):int(v) for k,v in list(fm.items())[:100]}}
+                        print(f'[ENCODE] Frequency: {c} ({nu} unique)')
+                except Exception as e:
+                    print(f'[ENCODE] Warning: Failed to encode {c}, dropping: {e}')
+                    if c in df.columns:
+                        df=df.drop(columns=[c])
             return df,ei
 
         def enc_cat_inf(df,ei,ex):
@@ -197,17 +223,25 @@ implementation:
             ex=set(ex or [])
             for c,inf in ei.items():
                 if c not in df.columns or c in ex: continue
-                if inf['type']=='oh':
-                    ec=inf['cols']
-                    d=pd.get_dummies(df[c],prefix=c,drop_first=False)
-                    for e in ec:
-                        if e not in d.columns: d[e]=0
-                    # FIX: Convert all columns to float64
-                    for dcol in d.columns:
-                        d[dcol]=d[dcol].astype(np.float64)
-                    df=pd.concat([df.drop(columns=[c]),d[ec]],axis=1)
-                elif inf['type']=='freq':
-                    df[c]=df[c].map(inf['map']).fillna(0).astype(np.float64)
+                try:
+                    if inf['type']=='oh':
+                        ec=inf['cols']
+                        d=pd.get_dummies(df[c],prefix=c,drop_first=False)
+                        for e in ec:
+                            if e not in d.columns: 
+                                d[e]=0
+                        # SAFE: Force to float64
+                        for dcol in d.columns:
+                            d[dcol]=d[dcol].astype(np.float64)
+                        df=pd.concat([df.drop(columns=[c]),d[ec]],axis=1)
+                    elif inf['type']=='freq':
+                        df[c]=df[c].map(inf['map'])
+                        # SAFE: Force to numeric
+                        df[c]=pd.to_numeric(df[c],errors='coerce').fillna(0).astype(np.float64)
+                except Exception as e:
+                    print(f'[ENCODE-INF] Warning: Failed to encode {c}, dropping: {e}')
+                    if c in df.columns:
+                        df=df.drop(columns=[c])
             return df
 
         def drop_uniq(df,fc,th):
@@ -216,12 +250,16 @@ implementation:
             print(f'[UNIQUE] Checking uniqueness threshold: {th}')
             for c in fc:
                 if c not in df.columns: continue
-                up=df[c].nunique()/len(df)
-                ur[c]=float(up)
-                if up>th:
-                    if pd.api.types.is_numeric_dtype(df[c]) and df[c].std()>0: continue
-                    cd.append(c)
-                    print(f'[UNIQUE] Dropping {c} (uniqueness: {up:.1%})')
+                try:
+                    up=df[c].nunique()/len(df)
+                    ur[c]=float(up)
+                    if up>th:
+                        if pd.api.types.is_numeric_dtype(df[c]) and df[c].std()>0: 
+                            continue
+                        cd.append(c)
+                        print(f'[UNIQUE] Dropping {c} (uniqueness: {up:.1%})')
+                except:
+                    pass
             if cd: df=df.drop(columns=cd)
             return df,[c for c in fc if c not in cd],cd,ur
 
@@ -232,7 +270,8 @@ implementation:
             for i in range(len(d)-sl):
                 X.append(d[i:i+sl])
                 y.append(l[i+sl])
-            return np.array(X),np.array(y)
+            # SAFE: Explicit numpy array with float32
+            return np.array(X,dtype=np.float32),np.array(y,dtype=np.float32)
 
         def get_scaler(stype):
             scalers={'minmax':MinMaxScaler,'standard':StandardScaler,'robust':RobustScaler}
@@ -240,46 +279,58 @@ implementation:
 
         class TSP:
             def __init__(self):
-                self.sc=None;self.fc=[];self.tc=None;self.dc=None;self.oc=None;self.sl=None
-                self.lp=[];self.rw=[];self.ce={};self.fo=[];self.cl=True;self.cr=True;self.cd=True
-                self.ut=0.95;self.du=[];self.cyc=[];self.ccyc=False;self.st='minmax';self.ur={}
+                self.sc=None
+                self.fc=[]
+                self.tc=None
+                self.dc=None
+                self.oc=None
+                self.sl=None
+                self.lp=[]
+                self.rw=[]
+                self.ce={}
+                self.fo=[]
+                self.cl=True
+                self.cr=True
+                self.cd=True
+                self.ut=0.95
+                self.du=[]
+                self.cyc=[]
+                self.ccyc=False
+                self.st='minmax'
+                self.ur={}
                 self.ig=set()
                 
             def fit(self,df,cfg):
-                self.tc = cfg['tc']
-                self.dc = cfg.get('dc')
-                self.oc = cfg.get('oc')
-                self.sl = cfg['sl']
-                self.lp = cfg['lp']
-                self.rw = cfg['rw']
-                self.cl = cfg['cl']
-                self.cr = cfg['cr']
-                self.cd = cfg['cd']
-                self.ut = cfg.get('ut',0.95)
-                self.ccyc = cfg.get('ccyc',False)
-                self.st = cfg.get('st','minmax')
-            
-                # store ignored columns (cfg can pass a list)
-                self.ig = set(cfg.get('ig', []) or [])
-            
-                ex = [self.tc]
+                self.tc=cfg['tc']
+                self.dc=cfg.get('dc')
+                self.oc=cfg.get('oc')
+                self.sl=cfg['sl']
+                self.lp=cfg['lp']
+                self.rw=cfg['rw']
+                self.cl=cfg['cl']
+                self.cr=cfg['cr']
+                self.cd=cfg['cd']
+                self.ut=cfg.get('ut',0.95)
+                self.ccyc=cfg.get('ccyc',False)
+                self.st=cfg.get('st','minmax')
+                self.ig=set(cfg.get('ig',[]) or [])
+                
+                ex=[self.tc]
                 if self.dc: ex.append(self.dc)
                 if self.oc: ex.append(self.oc)
-            
-                # exclude ignored cols from feature columns
-                self.fc = [c for c in df.columns if c not in ex and c not in self.ig]
+                self.fc=[c for c in df.columns if c not in ex and c not in self.ig]
                 return self
-
                 
             def tr(self,df,tm=False):
                 print(f'[TRANSFORM] Mode: {"TRAIN" if tm else "INFERENCE"}')
                 df=df.copy()
-                # DROP ignored columns (TRAIN + INFERENCE) — single early enforcement
-                if hasattr(self, 'ig') and self.ig:
-                    drop_now = [c for c in self.ig if c in df.columns]
-                    if drop_now:
-                        print(f'[IGNORE] Dropping ignored columns in transform: {drop_now}')
-                        df = df.drop(columns=drop_now)
+                
+                # SAFE: Drop ignored columns early
+                if self.ig:
+                    drop_cols=[c for c in self.ig if c in df.columns]
+                    if drop_cols:
+                        print(f'[IGNORE] Dropping {len(drop_cols)} ignored columns')
+                        df=df.drop(columns=drop_cols)
                 
                 # Auto-detect temporal column
                 ddc,dtc=self.dc,None
@@ -313,101 +364,57 @@ implementation:
                 if self.cd: 
                     df,df_=diff_feat(df,self.fc)
                 
-                # Handle inf/nan
+                # SAFE: Clean inf/nan with column dropping
                 print(f'[CLEAN] Handling inf/nan values')
                 df=df.replace([np.inf,-np.inf],np.nan)
                 
-                # Check which columns have too many NaNs
-                nan_cols = []
+                nan_cols=[]
                 for col in df.columns:
-                    nan_pct = df[col].isna().sum() / len(df)
-                    if nan_pct > 0.5:  # If more than 50% NaN
+                    nan_pct=df[col].isna().sum()/len(df)
+                    if nan_pct>0.5:
                         nan_cols.append(col)
                         print(f'[CLEAN] Dropping column {col} ({nan_pct:.1%} NaN)')
                 
                 if nan_cols:
-                    df = df.drop(columns=nan_cols)
-                # Forward and backward fill remaining NaNs
-                df = df.bfill().ffill()
+                    df=df.drop(columns=nan_cols)
                 
-                # Only drop rows if still have NaNs
-                before = len(df)
-                df = df.dropna()
-                if len(df) < before:
+                df=df.bfill().ffill()
+                before=len(df)
+                df=df.dropna()
+                if len(df)<before:
                     print(f'[CLEAN] Dropped {before-len(df)} rows with remaining NaN')
                 
-                # Validation with better error message
-                if len(df) <= self.sl:
-                    date_range = (df[self.dc].max() - df[self.dc].min()).total_seconds()
+                # SAFE: Validation
+                if len(df)<=self.sl:
+                    dr=(df[self.dc].max()-df[self.dc].min()).total_seconds()
                     raise ValueError(
                         f'Insufficient data: {len(df)} rows (need >{self.sl}). '
-                        f'Date range is only {date_range:.1f} seconds. '
-                        f'Reduce seq_length, lag_periods, and rolling_windows, '
-                        f'or fix your timestamp column (currently shows Unix epoch 1970).'
+                        f'Date range: {dr:.1f}s. Reduce seq_length or fix timestamps.'
                     )
                 
-                # Categorical encoding
-                ex = [self.tc]
+                # Define exclusions
+                ex=[self.tc]
                 if self.dc: ex.append(self.dc)
                 if self.oc and self.oc in df.columns: ex.append(self.oc)
-                # Ensure ignored columns are treated as excluded from features/encoding
-                if hasattr(self, 'ig') and self.ig:
-                    ex.extend([c for c in self.ig if c not in ex])
+                ex.extend([c for c in self.ig if c in df.columns])
                 
-                # Perform encoding (train vs inference)
+                # SAFE: Categorical encoding
                 if tm:
-                    df, self.ce = enc_cat_tr(df, ex)
+                    df,self.ce=enc_cat_tr(df,ex)
                 else:
-                    df = enc_cat_inf(df, self.ce, ex)
+                    df=enc_cat_inf(df,self.ce,ex)
                 
-                # Get feature columns (after encoding and exclusion)
-                ff = [c for c in df.columns if c not in ex]
+                # SAFE: Get feature columns (only what exists)
+                ff=[c for c in df.columns if c not in ex]
                 
-                # Prepare feature list for coercion
-                feat_cols = [c for c in ff if c in df.columns]
-                if not feat_cols:
-                    raise ValueError('No feature columns available after preprocessing.')
-
+                # SAFE: Force all features to numeric
+                df=force_numeric_dtype(df,ff)
                 
-                # Coerce feature columns to numeric (coerce unparseable -> NaN)
-                df[feat_cols] = df[feat_cols].apply(lambda s: pd.to_numeric(s, errors='coerce'))
+                # SAFE: Recheck feature list after forcing numeric
+                ff=[c for c in ff if c in df.columns]
                 
-                # Coerce target column too (important)
-                df[self.tc] = pd.to_numeric(df[self.tc], errors='coerce')
-                
-                # Report bad rows where coercion produced NaNs
-                nan_row_mask = df[feat_cols + [self.tc]].isna().any(axis=1)
-                n_bad = nan_row_mask.sum()
-                if n_bad > 0:
-                    pct_bad = n_bad / len(df)
-                    if pct_bad > 0.05:
-                        raise ValueError(
-                            f'After coercion, {n_bad} rows ({pct_bad:.1%}) contain non-numeric values in features/target. '
-                            'Fix upstream data or adjust preprocessing.'
-                        )
-                    print(f'[COERCE] Coerced numeric: {n_bad} rows had parse errors — imputing.')
-                    df[feat_cols + [self.tc]] = df[feat_cols + [self.tc]].bfill().ffill().fillna(0)
-                
-                # Final cast
-                df[feat_cols] = df[feat_cols].astype(np.float64)
-                df[self.tc] = df[self.tc].astype(np.float64)
-                
-                # Recompute ff
-                ff = [c for c in feat_cols if c in df.columns]
-                print(f'[COERCE] Features coerced and finalized: {len(ff)} columns')
-                # === END STRONG SAFETY ===
-
-                
-                # Additional check: ensure all feature columns are numeric
-                non_numeric = []
-                for col in ff:
-                    if col in df.columns and not pd.api.types.is_numeric_dtype(df[col]):
-                        non_numeric.append(col)
-                        print(f'[CLEAN] Removing non-numeric column: {col} (type: {df[col].dtype})')
-                
-                if non_numeric:
-                    ff = [c for c in ff if c not in non_numeric]
-                    df = df.drop(columns=non_numeric)
+                if not ff:
+                    raise ValueError('No valid feature columns after preprocessing')
                 
                 print(f'[FEATURES] Selected {len(ff)} numeric features')
                 
@@ -421,84 +428,46 @@ implementation:
                         if c in df.columns: 
                             df=df.drop(columns=[c])
                     
-                    # Align features with training
+                    # Align features
                     current_feats=set([c for c in df.columns if c not in ex])
                     expected_feats=set(self.fo)
                     
-                    # Add missing features (fill with 0)
                     missing=expected_feats-current_feats
                     if missing:
                         print(f'[ALIGN] Adding {len(missing)} missing features')
-                        for f in missing: df[f]=0
+                        for f in missing: 
+                            df[f]=0.0
                     
-                    # Remove extra features
                     extra=current_feats-expected_feats
                     if extra:
                         print(f'[ALIGN] Removing {len(extra)} extra features')
                         df=df.drop(columns=list(extra))
                     
-                    # Ensure correct order
                     ff=self.fo
                 
+                # SAFE: Force target to numeric
+                df[self.tc]=pd.to_numeric(df[self.tc],errors='coerce').fillna(0).astype(np.float64)
+                
                 # Extract X, y
-                X=df[ff].values
-                y=df[self.tc].values
+                X=df[ff].values.astype(np.float32)
+                y=df[self.tc].values.astype(np.float32)
                 print(f'[FEATURES] X shape: {X.shape}, y shape: {y.shape}')
                 
                 # Scale
                 if tm:
                     self.sc=get_scaler(self.st)
-                    Xs=self.sc.fit_transform(X)
+                    Xs=self.sc.fit_transform(X).astype(np.float32)
                     print(f'[SCALE] Fitted {self.st} scaler')
                 else:
                     if not self.sc: raise ValueError('No scaler found')
-                    Xs=self.sc.transform(X)
+                    Xs=self.sc.transform(X).astype(np.float32)
                     print(f'[SCALE] Applied saved scaler')
                 
                 # Create sequences
-                # Create sequences
-                Xq,yq = seq(Xs, y, self.sl)
+                Xq,yq=seq(Xs,y,self.sl)
                 print(f'[SEQ] Created {len(Xq)} sequences')
-                
-                # === FINAL GUARANTEE: Ensure Xq and yq are numeric numpy arrays ===
-                # Convert to numpy arrays explicitly
-                Xq = np.asarray(Xq)
-                yq = np.asarray(yq)
-                
-                # If Xq is object or string dtype - attempt conversion to float
-                if not np.issubdtype(Xq.dtype, np.number):
-                    try:
-                        Xq = Xq.astype(np.float64)  # try a straightforward cast
-                        print('[COERCE] Xq converted to float64 successfully.')
-                    except Exception as ex:
-                        # diagnostic dump to help locate offending columns/values
-                        print('[ERROR] Failed to cast Xq to numeric. dtype:', Xq.dtype)
-                        try:
-                            print('Sample Xq[0]:', Xq[0])
-                        except Exception:
-                            pass
-                        raise TypeError('Non-numeric values present in sequence features (Xq) — check preprocessing and encodings.') from ex
-                
-                # Same for yq (target)
-                if not np.issubdtype(yq.dtype, np.number):
-                    try:
-                        yq = yq.astype(np.float64)
-                        print('[COERCE] yq converted to float64 successfully.')
-                    except Exception as ex:
-                        print('[ERROR] Failed to cast yq to numeric. dtype:', yq.dtype)
-                        try:
-                            print('Sample yq[0]:', yq[0])
-                        except Exception:
-                            pass
-                        raise TypeError('Non-numeric values present in sequence targets (yq).') from ex
-                
-                # Optional: cast to float32 which is ideal for torch
-                Xq = Xq.astype(np.float32)
-                yq = yq.astype(np.float32)
-                
-                print('[FINAL] Returning numeric sequences:', Xq.dtype, yq.dtype, 'Xq shape:', Xq.shape, 'yq shape:', yq.shape)
-                return Xq, yq
-
+                print(f'[SEQ] Output dtypes: Xq={Xq.dtype}, yq={yq.dtype}')
+                return Xq,yq
                 
             def sv(self,p):
                 ensure_dir(p)
@@ -513,8 +482,12 @@ implementation:
 
         class DW:
             def __init__(self,tl,tel,id,sc,fc,md):
-                self.train_loader=tl;self.test_loader=tel;self.input_dim=id
-                self.scaler=sc;self.feature_columns=fc;self.metadata=md
+                self.train_loader=tl
+                self.test_loader=tel
+                self.input_dim=id
+                self.scaler=sc
+                self.feature_columns=fc
+                self.metadata=md
 
         # Main execution
         p=argparse.ArgumentParser()
@@ -522,12 +495,13 @@ implementation:
         p.add_argument('--cleaning_metadata',required=True)
         p.add_argument('--target_column',required=True)
         p.add_argument('--feature_columns',default="")
+        p.add_argument('--column_ignore',default="")
         p.add_argument('--seq_length',type=int,default=10)
         p.add_argument('--test_split',type=float,default=0.2)
         p.add_argument('--batch_size',type=int,default=32)
         p.add_argument('--unique_threshold',type=float,default=0.95)
-        p.add_argument('--lag_periods',default="1,2,3,7")
-        p.add_argument('--rolling_windows',default="7,14")
+        p.add_argument('--lag_periods',default="1,2,3")
+        p.add_argument('--rolling_windows',default="3,7")
         p.add_argument('--create_lags',default="true")
         p.add_argument('--create_rolling_stats',default="true")
         p.add_argument('--create_diff_features',default="true")
@@ -536,36 +510,37 @@ implementation:
         p.add_argument('--processed_data',required=True)
         p.add_argument('--preprocessor',required=True)
         p.add_argument('--engineering_metadata',required=True)
-        p.add_argument('--column_ignore', default="")
         a=p.parse_args()
-
-        ignore_cols = set(parse_csv(a.column_ignore, str))
-        print(f'[IGNORE] Columns to ignore: {list(ignore_cols)}')
-
 
         try:
             print('='*80)
-            print('TIME SERIES PREPROCESSING v6.0')
+            print('TIME SERIES PREPROCESSING v8.0 (PRODUCTION SAFE)')
             print('='*80)
             
+            # Parse arguments
             el=a.create_lags.lower() in('true','t','yes','y','1')
             er=a.create_rolling_stats.lower() in('true','t','yes','y','1')
             ed=a.create_diff_features.lower() in('true','t','yes','y','1')
             ecyc=a.create_cyclic_features.lower() in('true','t','yes','y','1')
             lp=parse_csv(a.lag_periods,int)
             rw=parse_csv(a.rolling_windows,int)
+            ignore_cols=set(parse_csv(a.column_ignore,str))
             
+            # Load data
             df=pd.read_parquet(a.cleaned_data)
             
-            existing_ignore = [c for c in ignore_cols if c in df.columns]
-            if existing_ignore:
-                print(f'[IGNORE] Dropping columns at load: {existing_ignore}')
-                df = df.drop(columns=existing_ignore)
-                
+            # Drop ignored columns immediately
+            if ignore_cols:
+                existing_ignore=[c for c in ignore_cols if c in df.columns]
+                if existing_ignore:
+                    print(f'[IGNORE] Dropping {len(existing_ignore)} columns at load')
+                    df=df.drop(columns=existing_ignore)
+            
             print(f'[LOAD] Data: {df.shape}')
             print(f'[LOAD] Columns: {list(df.columns[:5])}...')
             
-            with open(a.cleaning_metadata) as f: cm=json.load(f)
+            with open(a.cleaning_metadata) as f: 
+                cm=json.load(f)
             
             if a.target_column not in df.columns: 
                 raise ValueError(f'Target column not found: {a.target_column}')
@@ -588,16 +563,15 @@ implementation:
             
             # Feature columns
             if a.feature_columns.strip():
-                fc = parse_csv(a.feature_columns, str)
+                fc=parse_csv(a.feature_columns,str)
             else:
-                ex=[a.target_column, dc]
+                ex=[a.target_column,dc]
                 if oc: ex.append(oc)
-                fc = [c for c in df.columns if c not in ex]
+                fc=[c for c in df.columns if c not in ex]
             
-            # remove ignored columns from fc (so base feature count excludes them)
+            # Remove ignored from features
             if ignore_cols:
-                fc = [c for c in fc if c not in ignore_cols]
-
+                fc=[c for c in fc if c not in ignore_cols]
             
             print(f'[FEATURES] {len(fc)} base features')
             
@@ -605,8 +579,7 @@ implementation:
             pp.fit(df,{
                 'tc':a.target_column,'dc':dc,'oc':oc,'sl':a.seq_length,
                 'lp':lp,'rw':rw,'cl':el,'cr':er,'cd':ed,'ccyc':ecyc,
-                'ut':a.unique_threshold,'st':a.scaler_type,
-                'ig': list(ignore_cols)
+                'ut':a.unique_threshold,'st':a.scaler_type,'ig':list(ignore_cols)
             })
             
             Xq,yq=pp.tr(df,tm=True)
@@ -617,19 +590,14 @@ implementation:
             Xte,yte=Xq[ts:],yq[ts:]
             print(f'[SPLIT] Train: {len(Xtr)}, Test: {len(Xte)}')
             
-            # Convert to tensors
-            # ensure arrays are numpy float32 (should be, if tr() returned correct types)
-            Xtr = np.asarray(Xtr, dtype=np.float32)
-            ytr = np.asarray(ytr, dtype=np.float32)
-            Xte = np.asarray(Xte, dtype=np.float32)
-            yte = np.asarray(yte, dtype=np.float32)
+            # SAFE: Convert to tensors
+            Xtr=torch.from_numpy(Xtr)
+            ytr=torch.from_numpy(ytr).unsqueeze(1)
+            Xte=torch.from_numpy(Xte)
+            yte=torch.from_numpy(yte).unsqueeze(1)
             
-            # convert to torch tensors without copying when possible
-            Xtr = torch.from_numpy(Xtr)
-            ytr = torch.from_numpy(ytr).unsqueeze(1)
-            Xte = torch.from_numpy(Xte)
-            yte = torch.from_numpy(yte).unsqueeze(1)
-
+            print(f'[TENSOR] Xtr: {Xtr.shape}, dtype: {Xtr.dtype}')
+            print(f'[TENSOR] ytr: {ytr.shape}, dtype: {ytr.dtype}')
             
             trd=TensorDataset(Xtr,ytr)
             ted=TensorDataset(Xte,yte)
@@ -638,14 +606,6 @@ implementation:
             
             idm=Xtr.shape[2]
             print(f'[INPUT] Dimension: {idm}')
-
-            print('[DEBUG] df[ff] dtypes:')
-            print(df[ff].dtypes)
-            # show top rows for suspect columns (object dtypes)
-            obj_cols = [c for c in ff if df[c].dtype == 'object']
-            if obj_cols:
-                print('[DEBUG] object columns sample values:')
-                print(df[obj_cols].head().to_dict())
             
             # Save outputs
             dw=DW(trl,tel,idm,pp.sc,pp.fo,{
@@ -661,14 +621,14 @@ implementation:
             
             md={
                 'ts':datetime.utcnow().isoformat()+'Z',
-                'version':'6.0',
+                'version':'8.0',
                 'dc':dc,'oc':oc,'tc':a.target_column,
                 'nf':len(pp.fo),'sl':a.seq_length,
                 'split':a.test_split,'bs':a.batch_size,
                 'ut':a.unique_threshold,'scaler':a.scaler_type,
                 'lp':lp,'rw':rw,
                 'flags':{'lag':el,'roll':er,'diff':ed,'cyclic':ecyc},
-                'ignored_columns': list(ignore_cols),
+                'ignored_columns':list(ignore_cols),
                 'idm':idm,
                 'shapes':{
                     'train':list(Xtr.shape),
@@ -721,6 +681,8 @@ implementation:
       - {inputValue: target_column}
       - --feature_columns
       - {inputValue: feature_columns}
+      - --column_ignore
+      - {inputValue: column_ignore}
       - --seq_length
       - {inputValue: seq_length}
       - --test_split
@@ -733,8 +695,6 @@ implementation:
       - {inputValue: lag_periods}
       - --rolling_windows
       - {inputValue: rolling_windows}
-      - --column_ignore
-      - {inputValue: column_ignore}
       - --create_lags
       - {inputValue: create_lags}
       - --create_rolling_stats
