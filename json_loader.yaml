@@ -2,7 +2,7 @@ name: Load API Data v2.0
 description: Fetches JSON data from API endpoint and saves as Parquet dataset
 inputs:
   - {name: schema_id, type: String, description: 'The schema ID to fetch data from'}
-  - {name: token, type: String, description: 'Bearer token for authentication'}
+  - {name: token, type: string, description: 'Bearer token for authentication'}
   - {name: url_domain, type: String, description: 'The domain for the API endpoint'}
   - {name: page_size, type: Integer, default: "2000", optional: true, description: 'Number of records per page'}
   - {name: max_pages, type: Integer, default: "10", optional: true, description: 'Maximum pages to fetch (0 = all)'}
