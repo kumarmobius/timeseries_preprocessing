@@ -1,4 +1,4 @@
-name: Time Series Preprocessing v7
+name: Time Series Preprocessing v7.1
 inputs:
   - {name: cleaned_data, type: Dataset}
   - {name: cleaning_metadata, type: Data}
@@ -246,31 +246,40 @@ implementation:
                 self.ig=set()
                 
             def fit(self,df,cfg):
-                self.tc=cfg['tc'];self.dc=cfg.get('dc');self.oc=cfg.get('oc');self.sl=cfg['sl']
-                self.lp=cfg['lp'];self.rw=cfg['rw'];self.cl=cfg['cl'];self.cr=cfg['cr']
-                self.cd=cfg['cd'];self.ut=cfg.get('ut',0.95);self.ccyc=cfg.get('ccyc',False)
-                self.st=cfg.get('st','minmax')
-                ex=[self.tc]
+                self.tc = cfg['tc']
+                self.dc = cfg.get('dc')
+                self.oc = cfg.get('oc')
+                self.sl = cfg['sl']
+                self.lp = cfg['lp']
+                self.rw = cfg['rw']
+                self.cl = cfg['cl']
+                self.cr = cfg['cr']
+                self.cd = cfg['cd']
+                self.ut = cfg.get('ut',0.95)
+                self.ccyc = cfg.get('ccyc',False)
+                self.st = cfg.get('st','minmax')
+            
+                # store ignored columns (cfg can pass a list)
+                self.ig = set(cfg.get('ig', []) or [])
+            
+                ex = [self.tc]
                 if self.dc: ex.append(self.dc)
                 if self.oc: ex.append(self.oc)
+            
+                # exclude ignored cols from feature columns
                 self.fc = [c for c in df.columns if c not in ex and c not in self.ig]
                 return self
+
                 
             def tr(self,df,tm=False):
                 print(f'[TRANSFORM] Mode: {"TRAIN" if tm else "INFERENCE"}')
                 df=df.copy()
-                # DROP ignored columns (TRAIN + INFERENCE)
+                # DROP ignored columns (TRAIN + INFERENCE) — single early enforcement
                 if hasattr(self, 'ig') and self.ig:
                     drop_now = [c for c in self.ig if c in df.columns]
                     if drop_now:
                         print(f'[IGNORE] Dropping ignored columns in transform: {drop_now}')
                         df = df.drop(columns=drop_now)
-
-                if getattr(self, 'ig', None):
-                  drop_now = [c for c in self.ig if c in df.columns]
-                  if drop_now:
-                      print(f'[IGNORE] Dropping ignored columns in transform: {drop_now}')
-                      df = df.drop(columns=drop_now)
                 
                 # Auto-detect temporal column
                 ddc,dtc=self.dc,None
@@ -338,9 +347,13 @@ implementation:
                     )
                 
                 # Categorical encoding
-                ex=[self.tc]
+                ex = [self.tc]
                 if self.dc: ex.append(self.dc)
                 if self.oc and self.oc in df.columns: ex.append(self.oc)
+                # Ensure ignored columns are treated as excluded from features/encoding
+                if hasattr(self, 'ig') and self.ig:
+                    ex.extend([c for c in self.ig if c not in ex])
+
                 
                 # Ensure ignored columns are excluded everywhere
                 if hasattr(self, 'ig') and self.ig:
@@ -348,18 +361,39 @@ implementation:
 
                 
                 if tm:
-                    df,self.ce=enc_cat_tr(df,ex)
-                else:
-                    df=enc_cat_inf(df,self.ce,ex)
+                    df,self.ce=enc_cat_tr(df,eXq,yq=seq(Xs,y,self.sl)tire feature frame + target to numeric ===
+                feat_cols = [c for c in ff if c in df.columns]
+                if not feat_cols:
+                    raise ValueError('No feature columns available after preprocessing.')
                 
-                # Get feature columns
-                ff=[c for c in df.columns if c not in ex]
+                # Coerce feature columns to numeric (coerce unparseable -> NaN)
+                df[feat_cols] = df[feat_cols].apply(lambda s: pd.to_numeric(s, errors='coerce'))
                 
-                # FINAL SAFETY: Force all features to numeric
-                for col in ff:
-                    if col in df.columns and not pd.api.types.is_numeric_dtype(df[col]):
-                        print(f'[FORCE-NUMERIC] Converting {col} (type: {df[col].dtype})')
-                        df[col]=pd.to_numeric(df[col],errors='coerce').fillna(0).astype(np.float64)
+                # Coerce target column too (important)
+                df[self.tc] = pd.to_numeric(df[self.tc], errors='coerce')
+                
+                # Report bad rows where coercion produced NaNs
+                nan_row_mask = df[feat_cols + [self.tc]].isna().any(axis=1)
+                n_bad = nan_row_mask.sum()
+                if n_bad > 0:
+                    pct_bad = n_bad / len(df)
+                    if pct_bad > 0.05:
+                        raise ValueError(
+                            f'After coercion, {n_bad} rows ({pct_bad:.1%}) contain non-numeric values in features/target. '
+                            'Fix upstream data or adjust preprocessing.'
+                        )
+                    print(f'[COERCE] Coerced numeric: {n_bad} rows had parse errors — imputing.')
+                    df[feat_cols + [self.tc]] = df[feat_cols + [self.tc]].bfill().ffill().fillna(0)
+                
+                # Final cast
+                df[feat_cols] = df[feat_cols].astype(np.float64)
+                df[self.tc] = df[self.tc].astype(np.float64)
+                
+                # Recompute ff
+                ff = [c for c in feat_cols if c in df.columns]
+                print(f'[COERCE] Features coerced and finalized: {len(ff)} columns')
+                # === END STRONG SAFETY ===
+
                 
                 # Additional check: ensure all feature columns are numeric
                 non_numeric = []
@@ -419,9 +453,49 @@ implementation:
                     print(f'[SCALE] Applied saved scaler')
                 
                 # Create sequences
-                Xq,yq=seq(Xs,y,self.sl)
+                # Create sequences
+                Xq,yq = seq(Xs, y, self.sl)
                 print(f'[SEQ] Created {len(Xq)} sequences')
-                return Xq,yq
+                
+                # === FINAL GUARANTEE: Ensure Xq and yq are numeric numpy arrays ===
+                # Convert to numpy arrays explicitly
+                Xq = np.asarray(Xq)
+                yq = np.asarray(yq)
+                
+                # If Xq is object or string dtype - attempt conversion to float
+                if not np.issubdtype(Xq.dtype, np.number):
+                    try:
+                        Xq = Xq.astype(np.float64)  # try a straightforward cast
+                        print('[COERCE] Xq converted to float64 successfully.')
+                    except Exception as ex:
+                        # diagnostic dump to help locate offending columns/values
+                        print('[ERROR] Failed to cast Xq to numeric. dtype:', Xq.dtype)
+                        try:
+                            print('Sample Xq[0]:', Xq[0])
+                        except Exception:
+                            pass
+                        raise TypeError('Non-numeric values present in sequence features (Xq) — check preprocessing and encodings.') from ex
+                
+                # Same for yq (target)
+                if not np.issubdtype(yq.dtype, np.number):
+                    try:
+                        yq = yq.astype(np.float64)
+                        print('[COERCE] yq converted to float64 successfully.')
+                    except Exception as ex:
+                        print('[ERROR] Failed to cast yq to numeric. dtype:', yq.dtype)
+                        try:
+                            print('Sample yq[0]:', yq[0])
+                        except Exception:
+                            pass
+                        raise TypeError('Non-numeric values present in sequence targets (yq).') from ex
+                
+                # Optional: cast to float32 which is ideal for torch
+                Xq = Xq.astype(np.float32)
+                yq = yq.astype(np.float32)
+                
+                print('[FINAL] Returning numeric sequences:', Xq.dtype, yq.dtype, 'Xq shape:', Xq.shape, 'yq shape:', yq.shape)
+                return Xq, yq
+
                 
             def sv(self,p):
                 ensure_dir(p)
@@ -541,10 +615,18 @@ implementation:
             print(f'[SPLIT] Train: {len(Xtr)}, Test: {len(Xte)}')
             
             # Convert to tensors
-            Xtr=torch.tensor(Xtr,dtype=torch.float32)
-            ytr=torch.tensor(ytr,dtype=torch.float32).unsqueeze(1)
-            Xte=torch.tensor(Xte,dtype=torch.float32)
-            yte=torch.tensor(yte,dtype=torch.float32).unsqueeze(1)
+            # ensure arrays are numpy float32 (should be, if tr() returned correct types)
+            Xtr = np.asarray(Xtr, dtype=np.float32)
+            ytr = np.asarray(ytr, dtype=np.float32)
+            Xte = np.asarray(Xte, dtype=np.float32)
+            yte = np.asarray(yte, dtype=np.float32)
+            
+            # convert to torch tensors without copying when possible
+            Xtr = torch.from_numpy(Xtr)
+            ytr = torch.from_numpy(ytr).unsqueeze(1)
+            Xte = torch.from_numpy(Xte)
+            yte = torch.from_numpy(yte).unsqueeze(1)
+
             
             trd=TensorDataset(Xtr,ytr)
             ted=TensorDataset(Xte,yte)
@@ -553,6 +635,14 @@ implementation:
             
             idm=Xtr.shape[2]
             print(f'[INPUT] Dimension: {idm}')
+
+            print('[DEBUG] df[ff] dtypes:')
+            print(df[ff].dtypes)
+            # show top rows for suspect columns (object dtypes)
+            obj_cols = [c for c in ff if df[c].dtype == 'object']
+            if obj_cols:
+                print('[DEBUG] object columns sample values:')
+                print(df[obj_cols].head().to_dict())
             
             # Save outputs
             dw=DW(trl,tel,idm,pp.sc,pp.fo,{
