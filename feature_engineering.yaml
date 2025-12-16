@@ -1,5 +1,4 @@
-name: Time Series Preprocessing v5.0
-description: Preprocesses time series data with auto date/epoch detection and robust inference support for LSTM/RNN models
+name: Time Series Preprocessing v6.0
 inputs:
   - {name: cleaned_data, type: Dataset}
   - {name: cleaning_metadata, type: Data}
@@ -14,6 +13,8 @@ inputs:
   - {name: create_lags, type: String, optional: true, default: "true"}
   - {name: create_rolling_stats, type: String, optional: true, default: "true"}
   - {name: create_diff_features, type: String, optional: true, default: "true"}
+  - {name: create_cyclic_features, type: String, optional: true, default: "true"}
+  - {name: scaler_type, type: String, optional: true, default: "minmax"}
 outputs:
   - {name: processed_data, type: Dataset}
   - {name: preprocessor, type: Data}
@@ -26,11 +27,13 @@ implementation:
       - -u
       - -c
       - |
-        import argparse, json, cloudpickle, os, sys, traceback
+        import argparse, json, cloudpickle, os, sys, traceback, warnings
         from datetime import datetime
         import pandas as pd, numpy as np, torch
-        from sklearn.preprocessing import MinMaxScaler
+        from sklearn.preprocessing import MinMaxScaler, StandardScaler, RobustScaler
         from torch.utils.data import TensorDataset, DataLoader
+
+        warnings.filterwarnings('ignore')
 
         def ensure_dir(p):
             d=os.path.dirname(p)
@@ -40,10 +43,13 @@ implementation:
             return [dtype(x.strip()) for x in s.split(',') if x.strip()] if s.strip() else []
 
         def auto_detect_date(df):
-            kw=['date','time','timestamp','datetime','day','month','year','created','updated','modified']
+            print('[AUTO-DETECT] Searching for date columns...')
+            kw=['date','time','timestamp','datetime','day','month','year','created','updated','modified','release']
             cands=[]
             for col in df.columns:
-                if any(k in col.lower() for k in kw): cands.append((col,100))
+                if any(k in col.lower() for k in kw): 
+                    cands.append((col,100))
+                    print(f'[AUTO-DETECT] Found keyword match: {col}')
             for col in df.columns:
                 if col in [c[0] for c in cands] or pd.api.types.is_numeric_dtype(df[col]): continue
                 try:
@@ -51,11 +57,19 @@ implementation:
                     if len(s)==0: continue
                     p=pd.to_datetime(s,errors='coerce',format='mixed',dayfirst=True)
                     r=p.notna().sum()/len(s)
-                    if r>0.8: cands.append((col,r*50))
+                    if r>0.8: 
+                        cands.append((col,r*50))
+                        print(f'[AUTO-DETECT] Parseable date column: {col} ({r:.1%} success)')
                 except: pass
-            return cands[0][0] if cands else None
+            if cands:
+                best=max(cands,key=lambda x:x[1])
+                print(f'[AUTO-DETECT] Selected: {best[0]}')
+                return best[0]
+            print('[AUTO-DETECT] No date column found')
+            return None
 
         def detect_timestamp(df):
+            print('[TIMESTAMP] Checking for unix timestamps...')
             ranges={'seconds':(946684800,2524608000),'milliseconds':(946684800000,2524608000000),'microseconds':(946684800000000,2524608000000000)}
             kw=['timestamp','epoch','time','unix','ts','created_at','updated_at']
             cands=[]
@@ -67,53 +81,97 @@ implementation:
                 for u,(rn,rx) in ranges.items():
                     if rn<=mn and mx<=rx:
                         cands.append({'col':col,'unit':u,'pr':100 if nm else 50})
+                        print(f'[TIMESTAMP] Found {u} timestamp: {col}')
                         break
-            if not cands: return None,None
+            if not cands: 
+                print('[TIMESTAMP] No timestamp columns found')
+                return None,None
             c=max(cands,key=lambda x:x['pr'])
             col,u=c['col'],c['unit']
             try:
                 nc=col+'_datetime'
                 df[nc]=pd.to_datetime(df[col],unit='s' if u=='seconds' else 'ms' if u=='milliseconds' else 'us')
-                return (nc,col) if df[nc].notna().sum()>len(df)*0.95 else (None,None)
-            except: return None,None
+                if df[nc].notna().sum()>len(df)*0.95:
+                    print(f'[TIMESTAMP] Converted {col} to {nc}')
+                    return nc,col
+            except: pass
+            return None,None
 
         def parse_date(df,col):
-            if pd.api.types.is_datetime64_any_dtype(df[col]): return df[col]
-            for st in [lambda x:pd.to_datetime(x,errors='coerce',format='mixed',dayfirst=True),
-                       lambda x:pd.to_datetime(x,errors='coerce',format='mixed',dayfirst=False),
-                       lambda x:pd.to_datetime(x,errors='coerce',format='ISO8601'),
-                       lambda x:pd.to_datetime(x,errors='coerce',infer_datetime_format=True)]:
+            print(f'[PARSE] Parsing date column: {col}')
+            if pd.api.types.is_datetime64_any_dtype(df[col]): 
+                print('[PARSE] Already datetime type')
+                return df[col]
+            strats=[
+                ('mixed+dayfirst',lambda x:pd.to_datetime(x,errors='coerce',format='mixed',dayfirst=True)),
+                ('mixed',lambda x:pd.to_datetime(x,errors='coerce',format='mixed',dayfirst=False)),
+                ('ISO8601',lambda x:pd.to_datetime(x,errors='coerce',format='ISO8601')),
+                ('infer',lambda x:pd.to_datetime(x,errors='coerce',infer_datetime_format=True))
+            ]
+            for nm,st in strats:
                 try:
                     p=st(df[col])
-                    if p.notna().sum()/len(df[col])>0.95: return p
+                    r=p.notna().sum()/len(df[col])
+                    if r>0.95: 
+                        print(f'[PARSE] Success with {nm} strategy ({r:.1%})')
+                        return p
                 except: pass
-            raise ValueError('Cannot parse date:'+col)
+            raise ValueError(f'Cannot parse date column: {col}')
+
+        def add_cyclic_features(df,dc):
+            print('[CYCLIC] Adding temporal cyclic features...')
+            dt=pd.to_datetime(df[dc])
+            cyc={'hour':(24,'hour_sin','hour_cos'),
+                 'dayofweek':(7,'dow_sin','dow_cos'),
+                 'day':(31,'day_sin','day_cos'),
+                 'month':(12,'month_sin','month_cos'),
+                 'quarter':(4,'quarter_sin','quarter_cos')}
+            added=[]
+            for attr,(period,sn,cn) in cyc.items():
+                try:
+                    val=getattr(dt.dt,attr)
+                    df[sn]=np.sin(2*np.pi*val/period)
+                    df[cn]=np.cos(2*np.pi*val/period)
+                    added.extend([sn,cn])
+                except: pass
+            print(f'[CYCLIC] Added {len(added)} features: {added[:6]}...')
+            return df,added
 
         def lag_feat(df,cols,lags):
             nc=[c for c in cols if c in df.columns and pd.api.types.is_numeric_dtype(df[c])]
-            if not nc or not lags: return df
-            return pd.concat([df,pd.DataFrame({c+'_lag_'+str(l):df[c].shift(l) for c in nc for l in lags},index=df.index)],axis=1)
+            if not nc or not lags: return df,[]
+            print(f'[LAG] Creating lag features: {len(nc)} cols x {len(lags)} lags')
+            feats={f'{c}_lag{l}':df[c].shift(l) for c in nc for l in lags}
+            return pd.concat([df,pd.DataFrame(feats,index=df.index)],axis=1),list(feats.keys())
 
         def roll_feat(df,cols,wins):
             nc=[c for c in cols if c in df.columns and pd.api.types.is_numeric_dtype(df[c])]
-            if not nc or not wins: return df
-            rf={}
+            if not nc or not wins: return df,[]
+            print(f'[ROLLING] Creating rolling features: {len(nc)} cols x {len(wins)} windows')
+            feats={}
             for c in nc:
                 for w in wins:
-                    rf[c+'_rmean_'+str(w)]=df[c].rolling(w).mean()
-                    rf[c+'_rstd_'+str(w)]=df[c].rolling(w).std()
-                    rf[c+'_rmin_'+str(w)]=df[c].rolling(w).min()
-                    rf[c+'_rmax_'+str(w)]=df[c].rolling(w).max()
-            return pd.concat([df,pd.DataFrame(rf,index=df.index)],axis=1)
+                    feats[f'{c}_rmean{w}']=df[c].rolling(w).mean()
+                    feats[f'{c}_rstd{w}']=df[c].rolling(w).std()
+                    feats[f'{c}_rmin{w}']=df[c].rolling(w).min()
+                    feats[f'{c}_rmax{w}']=df[c].rolling(w).max()
+            return pd.concat([df,pd.DataFrame(feats,index=df.index)],axis=1),list(feats.keys())
 
         def diff_feat(df,cols):
             nc=[c for c in cols if c in df.columns and pd.api.types.is_numeric_dtype(df[c])]
-            if not nc: return df
-            return pd.concat([df,pd.DataFrame({c+'_diff':df[c].diff(),c+'_pct':df[c].pct_change() for c in nc},index=df.index)],axis=1)
+            if not nc: return df,[]
+            print(f'[DIFF] Creating difference features: {len(nc)} cols')
+            # FIX: Proper dict comprehension
+            diff_feats={f'{c}_diff':df[c].diff() for c in nc}
+            pct_feats={f'{c}_pct':df[c].pct_change() for c in nc}
+            feats={**diff_feats,**pct_feats}
+            return pd.concat([df,pd.DataFrame(feats,index=df.index)],axis=1),list(feats.keys())
 
         def enc_cat_tr(df,ex):
             ex=set(ex or [])
             cc=[c for c in df.select_dtypes(include=['object','category']).columns if c not in ex]
+            if not cc: return df,{}
+            print(f'[ENCODE] Encoding {len(cc)} categorical columns')
             ei={}
             for c in cc:
                 nu=df[c].nunique()
@@ -121,13 +179,17 @@ implementation:
                     d=pd.get_dummies(df[c],prefix=c,drop_first=False)
                     df=pd.concat([df.drop(columns=[c]),d],axis=1)
                     ei[c]={'type':'oh','cols':list(d.columns)}
+                    print(f'[ENCODE] One-hot: {c} -> {nu} columns')
                 else:
                     fm=df[c].value_counts().to_dict()
                     df[c]=df[c].map(fm).fillna(0)
-                    ei[c]={'type':'freq','map':fm}
+                    ei[c]={'type':'freq','map':{str(k):int(v) for k,v in list(fm.items())[:100]}}
+                    print(f'[ENCODE] Frequency: {c} ({nu} unique)')
             return df,ei
 
         def enc_cat_inf(df,ei,ex):
+            if not ei: return df
+            print(f'[ENCODE-INF] Applying saved encodings to {len(ei)} columns')
             ex=set(ex or [])
             for c,inf in ei.items():
                 if c not in df.columns or c in ex: continue
@@ -143,91 +205,176 @@ implementation:
 
         def drop_uniq(df,fc,th):
             cd=[]
+            ur={}
+            print(f'[UNIQUE] Checking uniqueness threshold: {th}')
             for c in fc:
                 if c not in df.columns: continue
                 up=df[c].nunique()/len(df)
+                ur[c]=float(up)
                 if up>th:
                     if pd.api.types.is_numeric_dtype(df[c]) and df[c].std()>0: continue
                     cd.append(c)
+                    print(f'[UNIQUE] Dropping {c} (uniqueness: {up:.1%})')
             if cd: df=df.drop(columns=cd)
-            return df,[c for c in fc if c not in cd],cd
+            return df,[c for c in fc if c not in cd],cd,ur
 
         def seq(d,l,sl):
+            if len(d)<=sl:
+                raise ValueError(f'Not enough data for sequences: {len(d)} rows, need >{sl}')
             X,y=[],[]
             for i in range(len(d)-sl):
                 X.append(d[i:i+sl])
                 y.append(l[i+sl])
             return np.array(X),np.array(y)
 
+        def get_scaler(stype):
+            scalers={'minmax':MinMaxScaler,'standard':StandardScaler,'robust':RobustScaler}
+            return scalers.get(stype.lower(),MinMaxScaler)()
+
         class TSP:
             def __init__(self):
-                self.sc=None;self.fc=[];self.tc=None;self.dc=None;self.oc=None;self.sl=None;self.lp=[];self.rw=[]
-                self.ce={};self.fo=[];self.cl=True;self.cr=True;self.cd=True;self.ut=0.95;self.du=[]
+                self.sc=None;self.fc=[];self.tc=None;self.dc=None;self.oc=None;self.sl=None
+                self.lp=[];self.rw=[];self.ce={};self.fo=[];self.cl=True;self.cr=True;self.cd=True
+                self.ut=0.95;self.du=[];self.cyc=[];self.ccyc=False;self.st='minmax';self.ur={}
+                
             def fit(self,df,cfg):
-                self.tc=cfg['tc'];self.dc=cfg.get('dc');self.oc=cfg.get('oc');self.sl=cfg['sl'];self.lp=cfg['lp']
-                self.rw=cfg['rw'];self.cl=cfg['cl'];self.cr=cfg['cr'];self.cd=cfg['cd'];self.ut=cfg.get('ut',0.95)
+                self.tc=cfg['tc'];self.dc=cfg.get('dc');self.oc=cfg.get('oc');self.sl=cfg['sl']
+                self.lp=cfg['lp'];self.rw=cfg['rw'];self.cl=cfg['cl'];self.cr=cfg['cr']
+                self.cd=cfg['cd'];self.ut=cfg.get('ut',0.95);self.ccyc=cfg.get('ccyc',False)
+                self.st=cfg.get('st','minmax')
                 ex=[self.tc]
                 if self.dc: ex.append(self.dc)
                 if self.oc: ex.append(self.oc)
                 self.fc=[c for c in df.columns if c not in ex]
                 return self
+                
             def tr(self,df,tm=False):
+                print(f'[TRANSFORM] Mode: {"TRAIN" if tm else "INFERENCE"}')
                 df=df.copy()
+                
+                # Auto-detect temporal column
                 ddc,dtc=self.dc,None
                 if not ddc or ddc not in df.columns:
                     ddc=auto_detect_date(df)
                 if not ddc:
                     ddc,dtc=detect_timestamp(df)
                 if not ddc:
-                    raise ValueError('No temporal column')
-                if ddc!=self.dc:
+                    raise ValueError('No temporal column found. Not time series data.')
+                
+                if tm and ddc!=self.dc:
                     self.dc=ddc
                     if dtc: self.oc=dtc
+                
+                # Parse and sort
                 df[self.dc]=parse_date(df,self.dc)
                 df=df.sort_values(by=self.dc).reset_index(drop=True)
-                if self.cl and self.lp: df=lag_feat(df,self.fc,self.lp)
-                if self.cr and self.rw: df=roll_feat(df,self.fc,self.rw)
-                if self.cd: df=diff_feat(df,self.fc)
-                df=df.replace([np.inf,-np.inf],np.nan).bfill().ffill().dropna()
+                print(f'[SORT] Date range: {df[self.dc].min()} to {df[self.dc].max()}')
+                
+                # Cyclic features
+                if tm and self.ccyc:
+                    df,self.cyc=add_cyclic_features(df,self.dc)
+                elif not tm and self.cyc:
+                    df,_=add_cyclic_features(df,self.dc)
+                
+                # Feature engineering
+                if self.cl and self.lp: 
+                    df,lf=lag_feat(df,self.fc,self.lp)
+                if self.cr and self.rw: 
+                    df,rf=roll_feat(df,self.fc,self.rw)
+                if self.cd: 
+                    df,df_=diff_feat(df,self.fc)
+                
+                # Handle inf/nan
+                print(f'[CLEAN] Handling inf/nan values')
+                df=df.replace([np.inf,-np.inf],np.nan).bfill().ffill()
+                before=len(df)
+                df=df.dropna()
+                if len(df)<before:
+                    print(f'[CLEAN] Dropped {before-len(df)} rows with NaN')
+                
+                # Validation
+                if len(df)<=self.sl:
+                    raise ValueError(f'Insufficient data: {len(df)} rows, need >{self.sl}')
+                
+                # Categorical encoding
                 ex=[self.tc]
                 if self.dc: ex.append(self.dc)
                 if self.oc and self.oc in df.columns: ex.append(self.oc)
+                
                 if tm:
                     df,self.ce=enc_cat_tr(df,ex)
                 else:
                     df=enc_cat_inf(df,self.ce,ex)
+                
+                # Get feature columns
                 ff=[c for c in df.columns if c not in ex]
+                
+                # Handle uniqueness
                 if tm:
-                    df,ff,self.du=drop_uniq(df,ff,self.ut)
+                    df,ff,self.du,self.ur=drop_uniq(df,ff,self.ut)
                     self.fo=ff
                 else:
+                    # Drop unique columns
                     for c in self.du:
-                        if c in df.columns: df=df.drop(columns=[c])
-                    mf=[f for f in self.fo if f not in df.columns]
-                    if mf:
-                        for f in mf: df[f]=0
-                    ef=[f for f in df.columns if f not in self.fo and f not in ex]
-                    if ef: df=df.drop(columns=ef)
+                        if c in df.columns: 
+                            df=df.drop(columns=[c])
+                    
+                    # Align features with training
+                    current_feats=set([c for c in df.columns if c not in ex])
+                    expected_feats=set(self.fo)
+                    
+                    # Add missing features (fill with 0)
+                    missing=expected_feats-current_feats
+                    if missing:
+                        print(f'[ALIGN] Adding {len(missing)} missing features')
+                        for f in missing: df[f]=0
+                    
+                    # Remove extra features
+                    extra=current_feats-expected_feats
+                    if extra:
+                        print(f'[ALIGN] Removing {len(extra)} extra features')
+                        df=df.drop(columns=list(extra))
+                    
+                    # Ensure correct order
                     ff=self.fo
-                X,y=df[ff].values,df[self.tc].values
+                
+                # Extract X, y
+                X=df[ff].values
+                y=df[self.tc].values
+                print(f'[FEATURES] X shape: {X.shape}, y shape: {y.shape}')
+                
+                # Scale
                 if tm:
-                    self.sc=MinMaxScaler()
+                    self.sc=get_scaler(self.st)
                     Xs=self.sc.fit_transform(X)
+                    print(f'[SCALE] Fitted {self.st} scaler')
                 else:
-                    if not self.sc: raise ValueError('No scaler')
+                    if not self.sc: raise ValueError('No scaler found')
                     Xs=self.sc.transform(X)
-                return seq(Xs,y,self.sl)
+                    print(f'[SCALE] Applied saved scaler')
+                
+                # Create sequences
+                Xq,yq=seq(Xs,y,self.sl)
+                print(f'[SEQ] Created {len(Xq)} sequences')
+                return Xq,yq
+                
             def sv(self,p):
                 ensure_dir(p)
-                with open(p,'wb') as f: cloudpickle.dump(self,f)
+                with open(p,'wb') as f: 
+                    cloudpickle.dump(self,f)
+                print(f'[SAVE] Preprocessor saved: {p}')
+                    
             @staticmethod
             def ld(p):
-                with open(p,'rb') as f: return cloudpickle.load(f)
+                with open(p,'rb') as f: 
+                    return cloudpickle.load(f)
 
         class DW:
             def __init__(self,tl,tel,id,sc,fc,md):
-                self.train_loader=tl;self.test_loader=tel;self.input_dim=id;self.scaler=sc;self.feature_columns=fc;self.metadata=md
+                self.train_loader=tl;self.test_loader=tel;self.input_dim=id
+                self.scaler=sc;self.feature_columns=fc;self.metadata=md
 
+        # Main execution
         p=argparse.ArgumentParser()
         p.add_argument('--cleaned_data',required=True)
         p.add_argument('--cleaning_metadata',required=True)
@@ -242,33 +389,51 @@ implementation:
         p.add_argument('--create_lags',default="true")
         p.add_argument('--create_rolling_stats',default="true")
         p.add_argument('--create_diff_features',default="true")
+        p.add_argument('--create_cyclic_features',default="true")
+        p.add_argument('--scaler_type',default="minmax")
         p.add_argument('--processed_data',required=True)
         p.add_argument('--preprocessor',required=True)
         p.add_argument('--engineering_metadata',required=True)
         a=p.parse_args()
 
         try:
-            print('='*80+' TIME SERIES v5.0 '+'='*80)
+            print('='*80)
+            print('TIME SERIES PREPROCESSING v6.0')
+            print('='*80)
+            
             el=a.create_lags.lower() in('true','t','yes','y','1')
             er=a.create_rolling_stats.lower() in('true','t','yes','y','1')
             ed=a.create_diff_features.lower() in('true','t','yes','y','1')
+            ecyc=a.create_cyclic_features.lower() in('true','t','yes','y','1')
             lp=parse_csv(a.lag_periods,int)
             rw=parse_csv(a.rolling_windows,int)
             
             df=pd.read_parquet(a.cleaned_data)
-            print('Loaded:',df.shape)
+            print(f'[LOAD] Data: {df.shape}')
+            print(f'[LOAD] Columns: {list(df.columns[:5])}...')
+            
             with open(a.cleaning_metadata) as f: cm=json.load(f)
             
-            if a.target_column not in df.columns: raise ValueError('No target:'+a.target_column)
+            if a.target_column not in df.columns: 
+                raise ValueError(f'Target column not found: {a.target_column}')
+            print(f'[TARGET] {a.target_column}')
             
+            # Initialize preprocessor
+            pp=TSP()
+            
+            # Auto-detect date
             dc=auto_detect_date(df)
             oc=None
-            if not dc: dc,oc=detect_timestamp(df)
-            if not dc: raise ValueError('No temporal column. Not time series data.')
+            if not dc: 
+                dc,oc=detect_timestamp(df)
+            if not dc: 
+                raise ValueError('No temporal column found')
             
+            # Parse and sort
             df[dc]=parse_date(df,dc)
             df=df.sort_values(by=dc).reset_index(drop=True)
             
+            # Feature columns
             if a.feature_columns.strip():
                 fc=parse_csv(a.feature_columns,str)
             else:
@@ -276,36 +441,24 @@ implementation:
                 if oc: ex.append(oc)
                 fc=[c for c in df.columns if c not in ex]
             
-            print('Features:',len(fc))
-            ish=df.shape
-            if el and lp: df=lag_feat(df,fc,lp)
-            if er and rw: df=roll_feat(df,fc,rw)
-            if ed: df=diff_feat(df,fc)
-            print('After eng:',df.shape)
+            print(f'[FEATURES] {len(fc)} base features')
             
-            nb=df.isna().sum().sum()
-            df=df.replace([np.inf,-np.inf],np.nan).bfill().ffill().dropna()
-            print('NaN:',nb,'->',df.isna().sum().sum())
+            # Fit and transform
+            pp.fit(df,{
+                'tc':a.target_column,'dc':dc,'oc':oc,'sl':a.seq_length,
+                'lp':lp,'rw':rw,'cl':el,'cr':er,'cd':ed,'ccyc':ecyc,
+                'ut':a.unique_threshold,'st':a.scaler_type
+            })
             
-            ex=[a.target_column,dc]
-            if oc: ex.append(oc)
-            df,ei=enc_cat_tr(df,ex)
-            print('After enc:',df.shape)
+            Xq,yq=pp.tr(df,tm=True)
             
-            ff=[c for c in df.columns if c not in ex]
-            df,ff,du=drop_uniq(df,ff,a.unique_threshold)
-            print('After drop uniq:',df.shape,'Dropped:',len(du))
-            
-            X,y=df[ff].values,df[a.target_column].values
-            sc=MinMaxScaler()
-            Xs=sc.fit_transform(X)
-            Xq,yq=seq(Xs,y,a.seq_length)
-            print('Sequences:',Xq.shape)
-            
+            # Split
             ts=int(len(Xq)*(1-a.test_split))
             Xtr,ytr=Xq[:ts],yq[:ts]
             Xte,yte=Xq[ts:],yq[ts:]
+            print(f'[SPLIT] Train: {len(Xtr)}, Test: {len(Xte)}')
             
+            # Convert to tensors
             Xtr=torch.tensor(Xtr,dtype=torch.float32)
             ytr=torch.tensor(ytr,dtype=torch.float32).unsqueeze(1)
             Xte=torch.tensor(Xte,dtype=torch.float32)
@@ -317,28 +470,70 @@ implementation:
             tel=DataLoader(ted,batch_size=a.batch_size,shuffle=False)
             
             idm=Xtr.shape[2]
-            print('Input dim:',idm)
+            print(f'[INPUT] Dimension: {idm}')
             
-            dw=DW(trl,tel,idm,sc,ff,{'sl':a.seq_length,'tc':a.target_column,'dc':dc,'ts':a.test_split,'bs':a.batch_size})
+            # Save outputs
+            dw=DW(trl,tel,idm,pp.sc,pp.fo,{
+                'sl':a.seq_length,'tc':a.target_column,'dc':dc,
+                'split':a.test_split,'bs':a.batch_size
+            })
             ensure_dir(a.processed_data)
-            with open(a.processed_data,'wb') as f: cloudpickle.dump(dw,f)
+            with open(a.processed_data,'wb') as f: 
+                cloudpickle.dump(dw,f)
+            print(f'[SAVE] Data wrapper: {a.processed_data}')
             
-            pp=TSP()
-            pp.fit(df,{'tc':a.target_column,'dc':dc,'oc':oc,'sl':a.seq_length,'lp':lp,'rw':rw,'cl':el,'cr':er,'cd':ed,'ut':a.unique_threshold})
-            pp.sc=sc;pp.ce=ei;pp.fo=ff;pp.du=du
             pp.sv(a.preprocessor)
             
-            md={'ts':datetime.utcnow().isoformat()+'Z','dc':dc,'tc':a.target_column,'nf':len(ff),'sl':a.seq_length,'split':a.test_split,
-                'bs':a.batch_size,'ut':a.unique_threshold,'lp':lp,'rw':rw,'cl':el,'cr':er,'cd':ed,'idm':idm,
-                'sh':{'xtr':list(Xtr.shape),'ytr':list(ytr.shape),'xte':list(Xte.shape),'yte':list(yte.shape)},
-                'dr':{'st':str(df[dc].min()),'en':str(df[dc].max())},'ish':list(ish),'fsh':list(df.shape),'du':du,'cm':cm}
+            md={
+                'ts':datetime.utcnow().isoformat()+'Z',
+                'version':'6.0',
+                'dc':dc,'oc':oc,'tc':a.target_column,
+                'nf':len(pp.fo),'sl':a.seq_length,
+                'split':a.test_split,'bs':a.batch_size,
+                'ut':a.unique_threshold,'scaler':a.scaler_type,
+                'lp':lp,'rw':rw,
+                'flags':{'lag':el,'roll':er,'diff':ed,'cyclic':ecyc},
+                'idm':idm,
+                'shapes':{
+                    'train':list(Xtr.shape),
+                    'test':list(Xte.shape)
+                },
+                'date_range':{
+                    'start':str(df[dc].min()),
+                    'end':str(df[dc].max())
+                },
+                'dropped_unique':pp.du,
+                'uniqueness':pp.ur,
+                'cyclic_features':pp.cyc,
+                'categorical_encodings':{k:v['type'] for k,v in pp.ce.items()},
+                'feature_count':{
+                    'base':len(fc),
+                    'lag':len(lp)*len(fc) if el else 0,
+                    'roll':len(rw)*4*len(fc) if er else 0,
+                    'diff':2*len(fc) if ed else 0,
+                    'cyclic':len(pp.cyc) if ecyc else 0,
+                    'final':len(pp.fo)
+                },
+                'cleaning_meta':cm
+            }
             ensure_dir(a.engineering_metadata)
-            with open(a.engineering_metadata,'w') as f: json.dump(md,f,indent=2)
+            with open(a.engineering_metadata,'w') as f: 
+                json.dump(md,f,indent=2)
+            print(f'[SAVE] Metadata: {a.engineering_metadata}')
             
-            print('='*80+' SUCCESS '+'='*80)
-            print('Train:',Xtr.shape,'Test:',Xte.shape,'Dim:',idm)
+            print('='*80)
+            print('SUCCESS')
+            print('='*80)
+            print(f'Train: {Xtr.shape} | Test: {Xte.shape}')
+            print(f'Features: {len(fc)} -> {idm}')
+            print(f'Sequences: {len(Xtr)+len(Xte)}')
+            print('='*80)
+            
         except Exception as e:
-            print('ERROR:',str(e),file=sys.stderr)
+            print('='*80,file=sys.stderr)
+            print('ERROR',file=sys.stderr)
+            print('='*80,file=sys.stderr)
+            print(str(e),file=sys.stderr)
             traceback.print_exc()
             sys.exit(1)
     args:
@@ -368,6 +563,10 @@ implementation:
       - {inputValue: create_rolling_stats}
       - --create_diff_features
       - {inputValue: create_diff_features}
+      - --create_cyclic_features
+      - {inputValue: create_cyclic_features}
+      - --scaler_type
+      - {inputValue: scaler_type}
       - --processed_data
       - {outputPath: processed_data}
       - --preprocessor
