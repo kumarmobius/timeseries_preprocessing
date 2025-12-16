@@ -1,4 +1,4 @@
-name: Time Series Preprocessing v7.4
+name: Time Series Preprocessing v7.5
 inputs:
   - {name: cleaned_data, type: Dataset}
   - {name: cleaning_metadata, type: Data}
@@ -353,18 +353,21 @@ implementation:
                 # Ensure ignored columns are treated as excluded from features/encoding
                 if hasattr(self, 'ig') and self.ig:
                     ex.extend([c for c in self.ig if c not in ex])
-
                 
-                # Ensure ignored columns are excluded everywhere
-                if hasattr(self, 'ig') and self.ig:
-                    ex.extend([c for c in self.ig if c not in ex])
-
-                
+                # Perform encoding (train vs inference)
                 if tm:
-                    df,self.ce=enc_cat_tr(df,Xq,yq=seq(Xs,y,self.sl))
+                    df, self.ce = enc_cat_tr(df, ex)
+                else:
+                    df = enc_cat_inf(df, self.ce, ex)
+                
+                # Get feature columns (after encoding and exclusion)
+                ff = [c for c in df.columns if c not in ex]
+                
+                # Prepare feature list for coercion
                 feat_cols = [c for c in ff if c in df.columns]
                 if not feat_cols:
                     raise ValueError('No feature columns available after preprocessing.')
+
                 
                 # Coerce feature columns to numeric (coerce unparseable -> NaN)
                 df[feat_cols] = df[feat_cols].apply(lambda s: pd.to_numeric(s, errors='coerce'))
