@@ -1,4 +1,4 @@
-name: Time Series Preprocessing v7.2
+name: Time Series Preprocessing v7.3
 inputs:
   - {name: cleaned_data, type: Dataset}
   - {name: cleaning_metadata, type: Data}
@@ -361,7 +361,7 @@ implementation:
 
                 
                 if tm:
-                    df,self.ce=enc_cat_tr(df,eXq,yq=seq(Xs,y,self.sl)
+                    df,self.ce=enc_cat_tr(df,eXq,yq=seq(Xs,y,self.sl))
                 feat_cols = [c for c in ff if c in df.columns]
                 if not feat_cols:
                     raise ValueError('No feature columns available after preprocessing.')
