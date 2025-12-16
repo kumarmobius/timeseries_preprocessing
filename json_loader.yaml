@@ -1,0 +1,327 @@
+name: Load API Data v2.0
+description: Fetches JSON data from API endpoint and saves as Parquet dataset
+inputs:
+  - {name: schema_id, type: String, description: 'The schema ID to fetch data from'}
+  - {name: token, type: String, description: 'Bearer token for authentication'}
+  - {name: url_domain, type: String, description: 'The domain for the API endpoint'}
+  - {name: page_size, type: Integer, default: "2000", optional: true, description: 'Number of records per page'}
+  - {name: max_pages, type: Integer, default: "10", optional: true, description: 'Maximum pages to fetch (0 = all)'}
+outputs:
+  - {name: dataset, type: Dataset, description: 'Dataset in Parquet format'}
+  - {name: metadata, type: Data, description: 'Metadata about the fetched data'}
+implementation:
+  container:
+    image: python:3.9
+    command:
+      - sh
+      - -c
+      - |
+        PIP_DISABLE_PIP_VERSION_CHECK=1 python3 -m pip install --quiet requests pandas pyarrow || \
+        PIP_DISABLE_PIP_VERSION_CHECK=1 python3 -m pip install --quiet requests pandas pyarrow --user
+        exec "$0" "$@"
+      - python3
+      - -u
+      - -c
+      - |
+        import argparse
+        import json
+        import os
+        import sys
+        import traceback
+        from datetime import datetime
+        import requests
+        import pandas as pd
+
+        def ensure_dir(path):
+            d = os.path.dirname(path)
+            if d: os.makedirs(d, exist_ok=True)
+
+        def fetch_data_from_api(schema_id, token, url_domain, page_size=2000, max_pages=10):
+            print('='*80)
+            print('FETCHING DATA FROM API')
+            print('='*80)
+            print(f'Schema ID: {schema_id}')
+            print(f'Domain: {url_domain}')
+            print(f'Page size: {page_size}')
+            print(f'Max pages: {max_pages} (0 = all)')
+            print()
+            
+            all_data = []
+            page = 0
+            total_records = 0
+            
+            while True:
+                # Check max pages limit
+                if max_pages > 0 and page >= max_pages:
+                    print(f'[LIMIT] Reached max pages limit: {max_pages}')
+                    break
+                
+                url = f'https://{url_domain}/pi-entity-instances-service/v2.0/schemas/{schema_id}/instances/list?page={page}&size={page_size}&showDBaaSReservedKeywords=true'
+                
+                headers = {
+                    'Content-Type': 'application/json',
+                    'Authorization': f'Bearer {token}'
+                }
+                
+                payload = {
+                    "dbType": "TIDB",
+                    "ownedOnly": True,
+                    "filter": {}
+                }
+                
+                print(f'[PAGE {page}] Fetching from API...')
+                
+                try:
+                    response = requests.post(url, headers=headers, json=payload, timeout=30)
+                    response.raise_for_status()
+                    
+                    data = response.json()
+                    
+                    # Extract records from response
+                    records = None
+                    if isinstance(data, dict):
+                        # Try common keys for paginated data
+                        for key in ('data', 'items', 'results', 'records', 'content', 'instances'):
+                            if key in data:
+                                records = data[key]
+                                print(f'[PAGE {page}] Extracted {len(records) if isinstance(records, list) else 1} records from key: {key}')
+                                break
+                        
+                        # If no known key found, use entire response
+                        if records is None:
+                            records = data
+                            print(f'[PAGE {page}] Using entire response as data')
+                    else:
+                        records = data
+                    
+                    # Handle records
+                    if isinstance(records, list):
+                        if len(records) == 0:
+                            print(f'[PAGE {page}] No more records, stopping pagination')
+                            break
+                        all_data.extend(records)
+                        total_records += len(records)
+                        print(f'[PAGE {page}] Fetched {len(records)} records (total: {total_records})')
+                        
+                        # If we got fewer records than page size, we've reached the end
+                        if len(records) < page_size:
+                            print(f'[PAGE {page}] Partial page received, stopping pagination')
+                            break
+                    else:
+                        # Single record or dict response
+                        all_data.append(records)
+                        total_records += 1
+                        print(f'[PAGE {page}] Fetched 1 record (total: {total_records})')
+                        break
+                    
+                    page += 1
+                    
+                except requests.exceptions.HTTPError as e:
+                    if e.response.status_code == 404 or e.response.status_code == 400:
+                        print(f'[PAGE {page}] No more data (HTTP {e.response.status_code}), stopping')
+                        break
+                    else:
+                        print(f'[ERROR] HTTP error on page {page}: {e}')
+                        raise
+                except Exception as e:
+                    print(f'[ERROR] Failed to fetch page {page}: {e}')
+                    raise
+            
+            print()
+            print(f'[SUMMARY] Total records fetched: {total_records}')
+            print(f'[SUMMARY] Total pages: {page}')
+            
+            if total_records == 0:
+                raise ValueError('No data fetched from API')
+            
+            return all_data
+
+        def convert_to_dataframe(data):
+            print('='*80)
+            print('CONVERTING TO DATAFRAME')
+            print('='*80)
+            
+            if isinstance(data, list):
+                print(f'[INFO] Processing list with {len(data)} items')
+                if len(data) == 0:
+                    raise ValueError('Empty data list')
+                
+                # Normalize nested JSON structures
+                df = pd.json_normalize(data)
+                print(f'[INFO] Created DataFrame: {df.shape}')
+            elif isinstance(data, dict):
+                print('[INFO] Processing single dictionary')
+                df = pd.json_normalize([data])
+                print(f'[INFO] Created DataFrame: {df.shape}')
+            else:
+                raise ValueError(f'Unexpected data type: {type(data)}')
+            
+            # Data quality checks
+            print()
+            print('[QUALITY] Data quality checks:')
+            print(f'  - Rows: {len(df):,}')
+            print(f'  - Columns: {len(df.columns):,}')
+            print(f'  - Memory: {df.memory_usage(deep=True).sum() / 1024 / 1024:.2f} MB')
+            
+            # Show column info
+            print()
+            print('[COLUMNS] Column summary:')
+            print(f'  - Columns: {list(df.columns[:10])}{"..." if len(df.columns) > 10 else ""}')
+            print(f'  - Dtypes: {df.dtypes.value_counts().to_dict()}')
+            
+            # Check for nulls
+            null_counts = df.isnull().sum()
+            null_cols = null_counts[null_counts > 0]
+            if len(null_cols) > 0:
+                print(f'  - Columns with nulls: {len(null_cols)}')
+                for col, count in null_cols.head(5).items():
+                    print(f'    • {col}: {count:,} ({count/len(df)*100:.1f}%)')
+            else:
+                print('  - No null values detected')
+            
+            # Check for duplicates
+            n_dupes = df.duplicated().sum()
+            if n_dupes > 0:
+                print(f'  - Duplicate rows: {n_dupes:,} ({n_dupes/len(df)*100:.1f}%)')
+            else:
+                print('  - No duplicate rows')
+            
+            # Show sample
+            print()
+            print('[SAMPLE] First 3 rows:')
+            print(df.head(3).to_string())
+            print()
+            
+            return df
+
+        def save_parquet(df, output_path):
+            print('='*80)
+            print('SAVING AS PARQUET')
+            print('='*80)
+            
+            ensure_dir(output_path)
+            
+            try:
+                df.to_parquet(output_path, index=False, engine='pyarrow', compression='snappy')
+                file_size = os.path.getsize(output_path)
+                print(f'[SUCCESS] Saved to: {output_path}')
+                print(f'[SUCCESS] File size: {file_size:,} bytes ({file_size/1024/1024:.2f} MB)')
+                return True
+            except Exception as e:
+                print(f'[ERROR] Parquet save failed: {e}')
+                print('[FALLBACK] Trying CSV format...')
+                
+                csv_path = output_path.replace('.parquet', '.csv')
+                try:
+                    df.to_csv(csv_path, index=False)
+                    file_size = os.path.getsize(csv_path)
+                    print(f'[SUCCESS] Saved as CSV: {csv_path}')
+                    print(f'[SUCCESS] File size: {file_size:,} bytes ({file_size/1024/1024:.2f} MB)')
+                    return False
+                except Exception as e2:
+                    print(f'[ERROR] CSV save also failed: {e2}')
+                    raise
+
+        # Parse arguments
+        parser = argparse.ArgumentParser(description='Load API Data v2.0')
+        parser.add_argument('--schema_id', type=str, required=True)
+        parser.add_argument('--token', type=str, required=True)
+        parser.add_argument('--url_domain', type=str, required=True)
+        parser.add_argument('--page_size', type=int, default=2000)
+        parser.add_argument('--max_pages', type=int, default=10)
+        parser.add_argument('--dataset', type=str, required=True)
+        parser.add_argument('--metadata', type=str, required=True)
+        args = parser.parse_args()
+
+        try:
+            print('='*80)
+            print('LOAD API DATA v2.0')
+            print('='*80)
+            print(f'Started at: {datetime.utcnow().isoformat()}Z')
+            print()
+            
+            # Read token from file
+            print('[AUTH] Reading authentication token...')
+            with open(args.token, 'r') as f:
+                token = f.read().strip()
+            print('[AUTH] Token loaded successfully')
+            print()
+            
+            # Fetch data from API
+            data = fetch_data_from_api(
+                args.schema_id,
+                token,
+                args.url_domain,
+                args.page_size,
+                args.max_pages
+            )
+            
+            # Convert to DataFrame
+            df = convert_to_dataframe(data)
+            
+            # Save as Parquet
+            parquet_saved = save_parquet(df, args.dataset)
+            
+            # Create metadata
+            print('='*80)
+            print('CREATING METADATA')
+            print('='*80)
+            
+            metadata = {
+                'timestamp': datetime.utcnow().isoformat() + 'Z',
+                'version': '2.0',
+                'schema_id': args.schema_id,
+                'url_domain': args.url_domain,
+                'format': 'parquet' if parquet_saved else 'csv',
+                'shape': list(df.shape),
+                'rows': int(df.shape[0]),
+                'columns': int(df.shape[1]),
+                'column_names': list(df.columns),
+                'dtypes': {str(k): str(v) for k, v in df.dtypes.items()},
+                'memory_mb': float(df.memory_usage(deep=True).sum() / 1024 / 1024),
+                'null_counts': {str(k): int(v) for k, v in df.isnull().sum().items() if v > 0},
+                'duplicate_rows': int(df.duplicated().sum()),
+                'page_size': args.page_size,
+                'max_pages': args.max_pages,
+                'output_path': args.dataset
+            }
+            
+            ensure_dir(args.metadata)
+            with open(args.metadata, 'w') as f:
+                json.dump(metadata, f, indent=2)
+            
+            print(f'[SAVED] Metadata saved to: {args.metadata}')
+            print()
+            
+            # Final summary
+            print('='*80)
+            print('SUCCESS')
+            print('='*80)
+            print(f'Records fetched: {len(df):,}')
+            print(f'Columns: {len(df.columns):,}')
+            print(f'Format: {metadata["format"].upper()}')
+            print(f'Output: {args.dataset}')
+            print('='*80)
+            
+        except Exception as e:
+            print('='*80, file=sys.stderr)
+            print('ERROR', file=sys.stderr)
+            print('='*80, file=sys.stderr)
+            print(f'Failed to load data: {e}', file=sys.stderr)
+            traceback.print_exc()
+            sys.exit(1)
+    args:
+      - --schema_id
+      - {inputValue: schema_id}
+      - --token
+      - {inputPath: token}
+      - --url_domain
+      - {inputValue: url_domain}
+      - --page_size
+      - {inputValue: page_size}
+      - --max_pages
+      - {inputValue: max_pages}
+      - --dataset
+      - {outputPath: dataset}
+      - --metadata
+      - {outputPath: metadata}
