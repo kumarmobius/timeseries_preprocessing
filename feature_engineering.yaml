@@ -1,22 +1,23 @@
-name: Time Series Preprocessing v4.1
+name: Time Series Preprocessing v5.0
+description: Preprocesses time series data with auto date/epoch detection and robust inference support for LSTM/RNN models
 inputs:
-  - {name: cleaned_data, type: Dataset, description: "Cleaned dataset from previous component"}
-  - {name: cleaning_metadata, type: Data, description: "Metadata from cleaning component"}
-  - {name: target_column, type: String, description: "Target column name to predict"}
-  - {name: feature_columns, type: String, description: "Comma-separated feature columns (leave empty to use all except target and date)", optional: true, default: ""}
-  - {name: seq_length, type: Integer, description: "Sequence window size for LSTM/RNN", optional: true, default: "10"}
-  - {name: test_split, type: Float, description: "Test split ratio (0.0-1.0)", optional: true, default: "0.2"}
-  - {name: batch_size, type: Integer, description: "Batch size for DataLoader", optional: true, default: "32"}
-  - {name: unique_threshold, type: Float, description: "Drop columns with uniqueness % above this (IDs, emails)", optional: true, default: "0.95"}
-  - {name: lag_periods, type: String, description: "Comma-separated lag periods (e.g., 1,2,3,7)", optional: true, default: "1,2,3,7"}
-  - {name: rolling_windows, type: String, description: "Comma-separated rolling window sizes (e.g., 7,14,30)", optional: true, default: "7,14"}
-  - {name: create_lags, type: String, description: "Enable lag feature creation (true/false)", optional: true, default: "true"}
-  - {name: create_rolling_stats, type: String, description: "Enable rolling statistics (true/false)", optional: true, default: "true"}
-  - {name: create_diff_features, type: String, description: "Enable difference features (true/false)", optional: true, default: "true"}
+  - {name: cleaned_data, type: Dataset}
+  - {name: cleaning_metadata, type: Data}
+  - {name: target_column, type: String}
+  - {name: feature_columns, type: String, optional: true, default: ""}
+  - {name: seq_length, type: Integer, optional: true, default: "10"}
+  - {name: test_split, type: Float, optional: true, default: "0.2"}
+  - {name: batch_size, type: Integer, optional: true, default: "32"}
+  - {name: unique_threshold, type: Float, optional: true, default: "0.95"}
+  - {name: lag_periods, type: String, optional: true, default: "1,2,3,7"}
+  - {name: rolling_windows, type: String, optional: true, default: "7,14"}
+  - {name: create_lags, type: String, optional: true, default: "true"}
+  - {name: create_rolling_stats, type: String, optional: true, default: "true"}
+  - {name: create_diff_features, type: String, optional: true, default: "true"}
 outputs:
-  - {name: processed_data, type: Dataset, description: "DataWrapper containing train_loader, test_loader, and input_dim"}
-  - {name: preprocessor, type: Data, description: "Fitted preprocessor for transforming new data"}
-  - {name: engineering_metadata, type: Data, description: "JSON metadata with preprocessing statistics"}
+  - {name: processed_data, type: Dataset}
+  - {name: preprocessor, type: Data}
+  - {name: engineering_metadata, type: Data}
 implementation:
   container:
     image: gurpreetgandhi/nesy-factory:v25
@@ -25,636 +26,319 @@ implementation:
       - -u
       - -c
       - |
-        import argparse
-        import json
-        import cloudpickle
-        import os
-        import pickle
-        import sys
-        import traceback
+        import argparse, json, cloudpickle, os, sys, traceback
         from datetime import datetime
-        import pandas as pd
-        import numpy as np
-        import torch
+        import pandas as pd, numpy as np, torch
         from sklearn.preprocessing import MinMaxScaler
         from torch.utils.data import TensorDataset, DataLoader
 
-        def ensure_dir_for(p):
-            d = os.path.dirname(p)
-            if d and not os.path.exists(d):
-                os.makedirs(d, exist_ok=True)
+        def ensure_dir(p):
+            d=os.path.dirname(p)
+            if d: os.makedirs(d,exist_ok=True)
 
-        def parse_comma_separated(s, dtype=int):
-            if not s or s.strip() == "":
-                return []
-            return [dtype(x.strip()) for x in s.split(',') if x.strip()]
+        def parse_csv(s,dtype=int):
+            return [dtype(x.strip()) for x in s.split(',') if x.strip()] if s.strip() else []
 
-        def auto_detect_date_column(df):
-            print('[INFO] Auto-detecting date column...')
-            
-            date_keywords = ['date', 'time', 'timestamp', 'datetime', 'day', 'month', 'year', 
-                           'created', 'updated', 'modified', 'released', 'release']
-            
-            candidate_columns = []
-            
-            # First pass: Check column names for date-related keywords
+        def auto_detect_date(df):
+            kw=['date','time','timestamp','datetime','day','month','year','created','updated','modified']
+            cands=[]
             for col in df.columns:
-                col_lower = col.lower()
-                if any(keyword in col_lower for keyword in date_keywords):
-                    candidate_columns.append((col, 100))  # High priority
-            
-            # Second pass: Try to parse each column as datetime
+                if any(k in col.lower() for k in kw): cands.append((col,100))
             for col in df.columns:
-                if col in [c[0] for c in candidate_columns]:
-                    continue
-                
-                # Skip numeric columns
-                if pd.api.types.is_numeric_dtype(df[col]):
-                    continue
-                
-                # Try parsing a sample of the column
+                if col in [c[0] for c in cands] or pd.api.types.is_numeric_dtype(df[col]): continue
                 try:
-                    sample = df[col].dropna().head(100)
-                    if len(sample) == 0:
-                        continue
-                    
-                    # Try to parse with mixed format
-                    parsed = pd.to_datetime(sample, errors='coerce', format='mixed', dayfirst=True)
-                    
-                    # If more than 80% parsed successfully, it's likely a date column
-                    success_rate = parsed.notna().sum() / len(sample)
-                    if success_rate > 0.8:
-                        candidate_columns.append((col, success_rate * 50))  # Medium priority
-                        print(f'[INFO] Found potential date column: {col} (success rate: {success_rate:.2%})')
-                
-                except Exception as e:
-                    continue
-            
-            if not candidate_columns:
-                print('[WARN] No date column detected. Proceeding without temporal ordering.')
-                return None
-            
-            # Sort by priority (highest first) and return the best candidate
-            candidate_columns.sort(key=lambda x: x[1], reverse=True)
-            detected_col = candidate_columns[0][0]
-            
-            print(f'[INFO] Selected date column: {detected_col}')
-            return detected_col
+                    s=df[col].dropna().head(100)
+                    if len(s)==0: continue
+                    p=pd.to_datetime(s,errors='coerce',format='mixed',dayfirst=True)
+                    r=p.notna().sum()/len(s)
+                    if r>0.8: cands.append((col,r*50))
+                except: pass
+            return cands[0][0] if cands else None
 
-        def parse_date_column(df, date_col):
-            print(f'[INFO] Parsing date column: {date_col}')
-            
-            original_dtype = df[date_col].dtype
-            print(f'[INFO] Original dtype: {original_dtype}')
-            
-            # If already datetime, return as-is
-            if pd.api.types.is_datetime64_any_dtype(df[date_col]):
-                print('[INFO] Column is already datetime type')
-                return df[date_col]
-            
-            # Try multiple parsing strategies
-            strategies = [
-                # Strategy 1: Mixed format with dayfirst=True (for DD-MM-YYYY)
-                lambda x: pd.to_datetime(x, errors='coerce', format='mixed', dayfirst=True),
-                
-                # Strategy 2: Mixed format with dayfirst=False (for MM-DD-YYYY)
-                lambda x: pd.to_datetime(x, errors='coerce', format='mixed', dayfirst=False),
-                
-                # Strategy 3: ISO8601 format
-                lambda x: pd.to_datetime(x, errors='coerce', format='ISO8601'),
-                
-                # Strategy 4: Infer format
-                lambda x: pd.to_datetime(x, errors='coerce', infer_datetime_format=True),
-            ]
-            
-            for i, strategy in enumerate(strategies, 1):
+        def detect_timestamp(df):
+            ranges={'seconds':(946684800,2524608000),'milliseconds':(946684800000,2524608000000),'microseconds':(946684800000000,2524608000000000)}
+            kw=['timestamp','epoch','time','unix','ts','created_at','updated_at']
+            cands=[]
+            for col in df.select_dtypes(include=[np.number]).columns:
+                nm=any(k in col.lower() for k in kw)
+                s=df[col].dropna()
+                if len(s)==0: continue
+                mn,mx=s.min(),s.max()
+                for u,(rn,rx) in ranges.items():
+                    if rn<=mn and mx<=rx:
+                        cands.append({'col':col,'unit':u,'pr':100 if nm else 50})
+                        break
+            if not cands: return None,None
+            c=max(cands,key=lambda x:x['pr'])
+            col,u=c['col'],c['unit']
+            try:
+                nc=col+'_datetime'
+                df[nc]=pd.to_datetime(df[col],unit='s' if u=='seconds' else 'ms' if u=='milliseconds' else 'us')
+                return (nc,col) if df[nc].notna().sum()>len(df)*0.95 else (None,None)
+            except: return None,None
+
+        def parse_date(df,col):
+            if pd.api.types.is_datetime64_any_dtype(df[col]): return df[col]
+            for st in [lambda x:pd.to_datetime(x,errors='coerce',format='mixed',dayfirst=True),
+                       lambda x:pd.to_datetime(x,errors='coerce',format='mixed',dayfirst=False),
+                       lambda x:pd.to_datetime(x,errors='coerce',format='ISO8601'),
+                       lambda x:pd.to_datetime(x,errors='coerce',infer_datetime_format=True)]:
                 try:
-                    parsed = strategy(df[date_col])
-                    success_rate = parsed.notna().sum() / len(df[date_col])
-                    
-                    print(f'[INFO] Strategy {i} success rate: {success_rate:.2%}')
-                    
-                    if success_rate > 0.95:  # At least 95% success
-                        print(f'[INFO] Using strategy {i} (success rate: {success_rate:.2%})')
-                        
-                        # Show sample of parsed dates
-                        sample_original = df[date_col].dropna().head(3).tolist()
-                        sample_parsed = parsed.dropna().head(3).tolist()
-                        print(f'[INFO] Sample original: {sample_original}')
-                        print(f'[INFO] Sample parsed: {sample_parsed}')
-                        
-                        return parsed
-                
-                except Exception as e:
-                    print(f'[WARN] Strategy {i} failed: {str(e)}')
-                    continue
-            
-            # If all strategies fail, raise error
-            raise ValueError(f'Failed to parse date column "{date_col}". Please check the date format.')
+                    p=st(df[col])
+                    if p.notna().sum()/len(df[col])>0.95: return p
+                except: pass
+            raise ValueError('Cannot parse date:'+col)
 
-        def create_lag_features(df, columns, lag_periods):
-            # Filter to numeric columns only
-            numeric_cols = [col for col in columns if col in df.columns and pd.api.types.is_numeric_dtype(df[col])]
-            print('[INFO] Creating lag features for', len(numeric_cols), 'numeric columns with lags:', lag_periods)
-            if len(numeric_cols) > 0:
-                print('[INFO] Numeric columns:', numeric_cols[:5], '...' if len(numeric_cols) > 5 else '')
-            
-            if not numeric_cols or not lag_periods:
-                return df
-            
-            # Create all lag features at once using concat for better performance
-            lag_features = {}
-            for col in numeric_cols:
-                for lag in lag_periods:
-                    lag_features[col + '_lag_' + str(lag)] = df[col].shift(lag)
-            
-            if lag_features:
-                df = pd.concat([df, pd.DataFrame(lag_features, index=df.index)], axis=1)
-            
-            return df
+        def lag_feat(df,cols,lags):
+            nc=[c for c in cols if c in df.columns and pd.api.types.is_numeric_dtype(df[c])]
+            if not nc or not lags: return df
+            return pd.concat([df,pd.DataFrame({c+'_lag_'+str(l):df[c].shift(l) for c in nc for l in lags},index=df.index)],axis=1)
 
-        def create_rolling_features(df, columns, rolling_windows):
-            # Filter to numeric columns only
-            numeric_cols = [col for col in columns if col in df.columns and pd.api.types.is_numeric_dtype(df[col])]
-            print('[INFO] Creating rolling features for', len(numeric_cols), 'numeric columns with windows:', rolling_windows)
-            if len(numeric_cols) > 0:
-                print('[INFO] Numeric columns:', numeric_cols[:5], '...' if len(numeric_cols) > 5 else '')
-            
-            if not numeric_cols or not rolling_windows:
-                return df
-            
-            # Create all rolling features at once using concat for better performance
-            rolling_features = {}
-            for col in numeric_cols:
-                for window in rolling_windows:
-                    rolling_features[col + '_rolling_mean_' + str(window)] = df[col].rolling(window).mean()
-                    rolling_features[col + '_rolling_std_' + str(window)] = df[col].rolling(window).std()
-                    rolling_features[col + '_rolling_min_' + str(window)] = df[col].rolling(window).min()
-                    rolling_features[col + '_rolling_max_' + str(window)] = df[col].rolling(window).max()
-            
-            if rolling_features:
-                df = pd.concat([df, pd.DataFrame(rolling_features, index=df.index)], axis=1)
-            
-            return df
+        def roll_feat(df,cols,wins):
+            nc=[c for c in cols if c in df.columns and pd.api.types.is_numeric_dtype(df[c])]
+            if not nc or not wins: return df
+            rf={}
+            for c in nc:
+                for w in wins:
+                    rf[c+'_rmean_'+str(w)]=df[c].rolling(w).mean()
+                    rf[c+'_rstd_'+str(w)]=df[c].rolling(w).std()
+                    rf[c+'_rmin_'+str(w)]=df[c].rolling(w).min()
+                    rf[c+'_rmax_'+str(w)]=df[c].rolling(w).max()
+            return pd.concat([df,pd.DataFrame(rf,index=df.index)],axis=1)
 
-        def create_diff_features(df, columns):
-            # Filter to numeric columns only
-            numeric_cols = [col for col in columns if col in df.columns and pd.api.types.is_numeric_dtype(df[col])]
-            print('[INFO] Creating difference features for', len(numeric_cols), 'numeric columns')
-            if len(numeric_cols) > 0:
-                print('[INFO] Numeric columns:', numeric_cols[:5], '...' if len(numeric_cols) > 5 else '')
-            
-            if not numeric_cols:
-                return df
-            
-            # Create all diff features at once using concat for better performance
-            diff_features = {}
-            for col in numeric_cols:
-                diff_features[col + '_diff'] = df[col].diff()
-                diff_features[col + '_pct_change'] = df[col].pct_change()
-            
-            if diff_features:
-                df = pd.concat([df, pd.DataFrame(diff_features, index=df.index)], axis=1)
-            
-            return df
+        def diff_feat(df,cols):
+            nc=[c for c in cols if c in df.columns and pd.api.types.is_numeric_dtype(df[c])]
+            if not nc: return df
+            return pd.concat([df,pd.DataFrame({c+'_diff':df[c].diff(),c+'_pct':df[c].pct_change() for c in nc},index=df.index)],axis=1)
 
-        def encode_categorical_safe(df, exclude_cols=None):
-            exclude_cols = set(exclude_cols or [])
-            categorical_cols = df.select_dtypes(include=['object', 'category']).columns
-            categorical_cols = [c for c in categorical_cols if c not in exclude_cols]
-            
-            encoding_info = {}
-            
-            for col in categorical_cols:
-                nunique = df[col].nunique()
-                print('[INFO] Encoding', col, 'with', nunique, 'unique values')
-                
-                if nunique <= 10:
-                    dummies = pd.get_dummies(df[col], prefix=col, drop_first=False)
-                    df = pd.concat([df.drop(columns=[col]), dummies], axis=1)
-                    encoding_info[col] = {
-                        'type': 'onehot',
-                        'columns': list(dummies.columns)
-                    }
-                    print('[INFO] One-hot encoded', col, 'into', len(dummies.columns), 'columns')
+        def enc_cat_tr(df,ex):
+            ex=set(ex or [])
+            cc=[c for c in df.select_dtypes(include=['object','category']).columns if c not in ex]
+            ei={}
+            for c in cc:
+                nu=df[c].nunique()
+                if nu<=10:
+                    d=pd.get_dummies(df[c],prefix=c,drop_first=False)
+                    df=pd.concat([df.drop(columns=[c]),d],axis=1)
+                    ei[c]={'type':'oh','cols':list(d.columns)}
                 else:
-                    freq_map = df[col].value_counts().to_dict()
-                    df[col] = df[col].map(freq_map).fillna(0)
-                    encoding_info[col] = {
-                        'type': 'frequency',
-                        'mapping': {str(k): int(v) for k, v in list(freq_map.items())[:10]}  # Save only top 10
-                    }
-                    print('[INFO] Frequency encoded', col)
-            
-            return df, encoding_info
+                    fm=df[c].value_counts().to_dict()
+                    df[c]=df[c].map(fm).fillna(0)
+                    ei[c]={'type':'freq','map':fm}
+            return df,ei
 
-        def drop_high_uniqueness_columns(df, feature_cols, unique_threshold):
-            print('[INFO] Checking for high-uniqueness columns (threshold:', unique_threshold, ')')
-            cols_to_drop = []
-            uniqueness_report = {}
-            
-            for col in feature_cols:
-                if col not in df.columns:
-                    continue
-                unique_pct = df[col].nunique() / len(df)
-                uniqueness_report[col] = float(unique_pct)
-                
-                if unique_pct > unique_threshold:
-                    if pd.api.types.is_numeric_dtype(df[col]):
-                        std = df[col].std()
-                        if std > 0:
-                            continue
-                    cols_to_drop.append(col)
-                    print('[WARN] Dropping', col, '(uniqueness:', round(unique_pct * 100, 2), '%)')
-            
-            if cols_to_drop:
-                df = df.drop(columns=cols_to_drop)
-                feature_cols = [c for c in feature_cols if c not in cols_to_drop]
-                print('[INFO] Dropped', len(cols_to_drop), 'high-uniqueness columns')
-            else:
-                print('[INFO] No high-uniqueness columns to drop')
-            
-            return df, feature_cols, cols_to_drop, uniqueness_report
+        def enc_cat_inf(df,ei,ex):
+            ex=set(ex or [])
+            for c,inf in ei.items():
+                if c not in df.columns or c in ex: continue
+                if inf['type']=='oh':
+                    ec=inf['cols']
+                    d=pd.get_dummies(df[c],prefix=c,drop_first=False)
+                    for e in ec:
+                        if e not in d.columns: d[e]=0
+                    df=pd.concat([df.drop(columns=[c]),d[ec]],axis=1)
+                elif inf['type']=='freq':
+                    df[c]=df[c].map(inf['map']).fillna(0)
+            return df
 
-        def create_sequences(data, labels, seq_length):
-            X, y = [], []
-            for i in range(len(data) - seq_length):
-                X.append(data[i:i+seq_length])
-                y.append(labels[i+seq_length])
-            return np.array(X), np.array(y)
+        def drop_uniq(df,fc,th):
+            cd=[]
+            for c in fc:
+                if c not in df.columns: continue
+                up=df[c].nunique()/len(df)
+                if up>th:
+                    if pd.api.types.is_numeric_dtype(df[c]) and df[c].std()>0: continue
+                    cd.append(c)
+            if cd: df=df.drop(columns=cd)
+            return df,[c for c in fc if c not in cd],cd
 
-        class TimeSeriesPreprocessor:
+        def seq(d,l,sl):
+            X,y=[],[]
+            for i in range(len(d)-sl):
+                X.append(d[i:i+sl])
+                y.append(l[i+sl])
+            return np.array(X),np.array(y)
+
+        class TSP:
             def __init__(self):
-                self.scaler = None
-                self.feature_columns = []
-                self.target_column = None
-                self.date_column = None
-                self.seq_length = None
-                self.lag_periods = []
-                self.rolling_windows = []
-                self.categorical_encodings = {}
-                self.feature_order = []
-                self.create_lags = True
-                self.create_rolling_stats = True
-                self.create_diff_features = True
-                self.unique_threshold = 0.95
-                
-            def fit(self, df, config):
-                self.target_column = config['target_column']
-                self.date_column = config.get('date_column')
-                self.seq_length = config['seq_length']
-                self.lag_periods = config['lag_periods']
-                self.rolling_windows = config['rolling_windows']
-                self.create_lags = config['create_lags']
-                self.create_rolling_stats = config['create_rolling_stats']
-                self.create_diff_features = config['create_diff_features']
-                self.unique_threshold = config.get('unique_threshold', 0.95)
-                
-                exclude_cols = [self.target_column]
-                if self.date_column:
-                    exclude_cols.append(self.date_column)
-                
-                self.feature_columns = [c for c in df.columns if c not in exclude_cols]
-                
+                self.sc=None;self.fc=[];self.tc=None;self.dc=None;self.oc=None;self.sl=None;self.lp=[];self.rw=[]
+                self.ce={};self.fo=[];self.cl=True;self.cr=True;self.cd=True;self.ut=0.95;self.du=[]
+            def fit(self,df,cfg):
+                self.tc=cfg['tc'];self.dc=cfg.get('dc');self.oc=cfg.get('oc');self.sl=cfg['sl'];self.lp=cfg['lp']
+                self.rw=cfg['rw'];self.cl=cfg['cl'];self.cr=cfg['cr'];self.cd=cfg['cd'];self.ut=cfg.get('ut',0.95)
+                ex=[self.tc]
+                if self.dc: ex.append(self.dc)
+                if self.oc: ex.append(self.oc)
+                self.fc=[c for c in df.columns if c not in ex]
                 return self
-                
-            def transform(self, df):
-                df = df.copy()
-                
-                if self.date_column and self.date_column in df.columns:
-                    df[self.date_column] = parse_date_column(df, self.date_column)
-                    df = df.sort_values(by=self.date_column).reset_index(drop=True)
-                
-                # Check boolean flags properly (they are stored as booleans, not callables)
-                if self.create_lags is True and self.lag_periods:
-                    df = create_lag_features(df, self.feature_columns, self.lag_periods)
-                
-                if self.create_rolling_stats is True and self.rolling_windows:
-                    df = create_rolling_features(df, self.feature_columns, self.rolling_windows)
-                
-                if self.create_diff_features is True:
-                    df = create_diff_features(df, self.feature_columns)
-                
-                df = df.bfill().ffill()
-                
-                exclude = [self.target_column]
-                if self.date_column and self.date_column in df.columns:
-                    exclude.append(self.date_column)
-                
-                df, _ = encode_categorical_safe(df, exclude_cols=exclude)
-                
-                final_features = [c for c in df.columns if c not in exclude]
-                
-                df, final_features, _, _ = drop_high_uniqueness_columns(df, final_features, self.unique_threshold)
-                
-                X = df[final_features].values
-                y = df[self.target_column].values
-                
-                if self.scaler is not None:
-                    X_scaled = self.scaler.transform(X)
+            def tr(self,df,tm=False):
+                df=df.copy()
+                ddc,dtc=self.dc,None
+                if not ddc or ddc not in df.columns:
+                    ddc=auto_detect_date(df)
+                if not ddc:
+                    ddc,dtc=detect_timestamp(df)
+                if not ddc:
+                    raise ValueError('No temporal column')
+                if ddc!=self.dc:
+                    self.dc=ddc
+                    if dtc: self.oc=dtc
+                df[self.dc]=parse_date(df,self.dc)
+                df=df.sort_values(by=self.dc).reset_index(drop=True)
+                if self.cl and self.lp: df=lag_feat(df,self.fc,self.lp)
+                if self.cr and self.rw: df=roll_feat(df,self.fc,self.rw)
+                if self.cd: df=diff_feat(df,self.fc)
+                df=df.replace([np.inf,-np.inf],np.nan).bfill().ffill().dropna()
+                ex=[self.tc]
+                if self.dc: ex.append(self.dc)
+                if self.oc and self.oc in df.columns: ex.append(self.oc)
+                if tm:
+                    df,self.ce=enc_cat_tr(df,ex)
                 else:
-                    self.scaler = MinMaxScaler()
-                    X_scaled = self.scaler.fit_transform(X)
-                
-                X_seq, y_seq = create_sequences(X_scaled, y, self.seq_length)
-                
-                return X_seq, y_seq
-            
-            def save(self, path):
-                ensure_dir_for(path)
-                with open(path, 'wb') as f:
-                    cloudpickle.dump(self, f)
-                                
+                    df=enc_cat_inf(df,self.ce,ex)
+                ff=[c for c in df.columns if c not in ex]
+                if tm:
+                    df,ff,self.du=drop_uniq(df,ff,self.ut)
+                    self.fo=ff
+                else:
+                    for c in self.du:
+                        if c in df.columns: df=df.drop(columns=[c])
+                    mf=[f for f in self.fo if f not in df.columns]
+                    if mf:
+                        for f in mf: df[f]=0
+                    ef=[f for f in df.columns if f not in self.fo and f not in ex]
+                    if ef: df=df.drop(columns=ef)
+                    ff=self.fo
+                X,y=df[ff].values,df[self.tc].values
+                if tm:
+                    self.sc=MinMaxScaler()
+                    Xs=self.sc.fit_transform(X)
+                else:
+                    if not self.sc: raise ValueError('No scaler')
+                    Xs=self.sc.transform(X)
+                return seq(Xs,y,self.sl)
+            def sv(self,p):
+                ensure_dir(p)
+                with open(p,'wb') as f: cloudpickle.dump(self,f)
             @staticmethod
-            def load(path):
-                with open(path, 'rb') as f:
-                    return pickle.load(f)
+            def ld(p):
+                with open(p,'rb') as f: return cloudpickle.load(f)
 
-        class DataWrapper:
-            def __init__(self, train_loader, test_loader, input_dim, scaler, feature_columns, metadata):
-                self.train_loader = train_loader
-                self.test_loader = test_loader
-                self.input_dim = input_dim
-                self.scaler = scaler
-                self.feature_columns = feature_columns
-                self.metadata = metadata
+        class DW:
+            def __init__(self,tl,tel,id,sc,fc,md):
+                self.train_loader=tl;self.test_loader=tel;self.input_dim=id;self.scaler=sc;self.feature_columns=fc;self.metadata=md
 
-        parser = argparse.ArgumentParser()
-        parser.add_argument('--cleaned_data', type=str, required=True)
-        parser.add_argument('--cleaning_metadata', type=str, required=True)
-        parser.add_argument('--target_column', type=str, required=True)
-        parser.add_argument('--feature_columns', type=str, default="")
-        parser.add_argument('--seq_length', type=int, default=10)
-        parser.add_argument('--test_split', type=float, default=0.2)
-        parser.add_argument('--batch_size', type=int, default=32)
-        parser.add_argument('--unique_threshold', type=float, default=0.95)
-        parser.add_argument('--lag_periods', type=str, default="1,2,3,7")
-        parser.add_argument('--rolling_windows', type=str, default="7,14")
-        parser.add_argument('--create_lags', type=str, default="true")
-        parser.add_argument('--create_rolling_stats', type=str, default="true")
-        parser.add_argument('--create_diff_features', type=str, default="true")
-        parser.add_argument('--processed_data', type=str, required=True)
-        parser.add_argument('--preprocessor', type=str, required=True)
-        parser.add_argument('--engineering_metadata', type=str, required=True)
-        args = parser.parse_args()
+        p=argparse.ArgumentParser()
+        p.add_argument('--cleaned_data',required=True)
+        p.add_argument('--cleaning_metadata',required=True)
+        p.add_argument('--target_column',required=True)
+        p.add_argument('--feature_columns',default="")
+        p.add_argument('--seq_length',type=int,default=10)
+        p.add_argument('--test_split',type=float,default=0.2)
+        p.add_argument('--batch_size',type=int,default=32)
+        p.add_argument('--unique_threshold',type=float,default=0.95)
+        p.add_argument('--lag_periods',default="1,2,3,7")
+        p.add_argument('--rolling_windows',default="7,14")
+        p.add_argument('--create_lags',default="true")
+        p.add_argument('--create_rolling_stats',default="true")
+        p.add_argument('--create_diff_features',default="true")
+        p.add_argument('--processed_data',required=True)
+        p.add_argument('--preprocessor',required=True)
+        p.add_argument('--engineering_metadata',required=True)
+        a=p.parse_args()
 
         try:
-            print("="*80)
-            print("TIME SERIES PREPROCESSING v3.1 (AUTO DATE DETECTION)")
-            print("="*80)
+            print('='*80+' TIME SERIES v5.0 '+'='*80)
+            el=a.create_lags.lower() in('true','t','yes','y','1')
+            er=a.create_rolling_stats.lower() in('true','t','yes','y','1')
+            ed=a.create_diff_features.lower() in('true','t','yes','y','1')
+            lp=parse_csv(a.lag_periods,int)
+            rw=parse_csv(a.rolling_windows,int)
             
-            # FIXED: Renamed variables to avoid shadowing function names
-            enable_lags = args.create_lags.lower() in ('true', 't', 'yes', 'y', '1')
-            enable_rolling_stats = args.create_rolling_stats.lower() in ('true', 't', 'yes', 'y', '1')
-            enable_diff_features = args.create_diff_features.lower() in ('true', 't', 'yes', 'y', '1')
+            df=pd.read_parquet(a.cleaned_data)
+            print('Loaded:',df.shape)
+            with open(a.cleaning_metadata) as f: cm=json.load(f)
             
-            lag_periods = parse_comma_separated(args.lag_periods, int)
-            rolling_windows = parse_comma_separated(args.rolling_windows, int)
+            if a.target_column not in df.columns: raise ValueError('No target:'+a.target_column)
             
-            print('[STEP 1/13] Loading data...')
-            df = pd.read_parquet(args.cleaned_data)
-            print('[INFO] Loaded data shape:', df.shape)
-            print('[INFO] Columns:', list(df.columns))
+            dc=auto_detect_date(df)
+            oc=None
+            if not dc: dc,oc=detect_timestamp(df)
+            if not dc: raise ValueError('No temporal column. Not time series data.')
             
-            with open(args.cleaning_metadata, 'r') as f:
-                cleaning_meta = json.load(f)
+            df[dc]=parse_date(df,dc)
+            df=df.sort_values(by=dc).reset_index(drop=True)
             
-            print('[STEP 2/13] Validating target column...')
-            if args.target_column not in df.columns:
-                raise ValueError('Target column not found: ' + args.target_column)
-            print('[INFO] Target column:', args.target_column)
-            
-            print('[STEP 3/13] Auto-detecting date column...')
-            date_column = auto_detect_date_column(df)
-            
-            if date_column:
-                print('[INFO] Detected date column:', date_column)
-                
-                print('[STEP 4/13] Parsing and sorting by date (CRITICAL for time series)...')
-                df[date_column] = parse_date_column(df, date_column)
-                df = df.sort_values(by=date_column).reset_index(drop=True)
-                print('[INFO] Date range:', df[date_column].min(), 'to', df[date_column].max())
+            if a.feature_columns.strip():
+                fc=parse_csv(a.feature_columns,str)
             else:
-                print('[WARN] No date column detected - proceeding without temporal ordering')
-                print('[WARN] This may impact time series model performance')
+                ex=[a.target_column,dc]
+                if oc: ex.append(oc)
+                fc=[c for c in df.columns if c not in ex]
             
-            print('[STEP 5/13] Determining feature columns...')
-            if args.feature_columns.strip():
-                feature_cols = parse_comma_separated(args.feature_columns, str)
-                missing = [c for c in feature_cols if c not in df.columns]
-                if missing:
-                    raise ValueError('Feature columns not found: ' + str(missing))
-            else:
-                exclude = [args.target_column]
-                if date_column:
-                    exclude.append(date_column)
-                feature_cols = [c for c in df.columns if c not in exclude]
+            print('Features:',len(fc))
+            ish=df.shape
+            if el and lp: df=lag_feat(df,fc,lp)
+            if er and rw: df=roll_feat(df,fc,rw)
+            if ed: df=diff_feat(df,fc)
+            print('After eng:',df.shape)
             
-            print('[INFO] Feature columns:', len(feature_cols))
-            print('[INFO] Features:', feature_cols[:5], '...' if len(feature_cols) > 5 else '')
+            nb=df.isna().sum().sum()
+            df=df.replace([np.inf,-np.inf],np.nan).bfill().ffill().dropna()
+            print('NaN:',nb,'->',df.isna().sum().sum())
             
-            print('[STEP 6/13] Creating time series features...')
-            initial_shape = df.shape
+            ex=[a.target_column,dc]
+            if oc: ex.append(oc)
+            df,ei=enc_cat_tr(df,ex)
+            print('After enc:',df.shape)
             
-            # FIXED: Using renamed variables instead of function names
-            if enable_lags and lag_periods:
-                df = create_lag_features(df, feature_cols, lag_periods)
+            ff=[c for c in df.columns if c not in ex]
+            df,ff,du=drop_uniq(df,ff,a.unique_threshold)
+            print('After drop uniq:',df.shape,'Dropped:',len(du))
             
-            if enable_rolling_stats and rolling_windows:
-                df = create_rolling_features(df, feature_cols, rolling_windows)
+            X,y=df[ff].values,df[a.target_column].values
+            sc=MinMaxScaler()
+            Xs=sc.fit_transform(X)
+            Xq,yq=seq(Xs,y,a.seq_length)
+            print('Sequences:',Xq.shape)
             
-            if enable_diff_features:
-                df = create_diff_features(df, feature_cols)
+            ts=int(len(Xq)*(1-a.test_split))
+            Xtr,ytr=Xq[:ts],yq[:ts]
+            Xte,yte=Xq[ts:],yq[ts:]
             
-            print('[INFO] Shape after feature engineering:', df.shape)
-            print('[INFO] Created', df.shape[1] - initial_shape[1], 'new features')
+            Xtr=torch.tensor(Xtr,dtype=torch.float32)
+            ytr=torch.tensor(ytr,dtype=torch.float32).unsqueeze(1)
+            Xte=torch.tensor(Xte,dtype=torch.float32)
+            yte=torch.tensor(yte,dtype=torch.float32).unsqueeze(1)
             
-            print('[STEP 7/13] Handling missing values and infinity values...')
-            nan_before = df.isna().sum().sum()
+            trd=TensorDataset(Xtr,ytr)
+            ted=TensorDataset(Xte,yte)
+            trl=DataLoader(trd,batch_size=a.batch_size,shuffle=False)
+            tel=DataLoader(ted,batch_size=a.batch_size,shuffle=False)
             
-            # Replace infinity values with NaN
-            df = df.replace([np.inf, -np.inf], np.nan)
-            inf_count = df.isna().sum().sum() - nan_before
-            if inf_count > 0:
-                print('[INFO] Replaced', inf_count, 'infinity values with NaN')
+            idm=Xtr.shape[2]
+            print('Input dim:',idm)
             
-            # Backward-fill then forward-fill
-            df = df.bfill()
-            df = df.ffill()
-            df = df.dropna()
-            nan_after = df.isna().sum().sum()
-            print('[INFO] NaN values:', nan_before, '->', nan_after)
-            print('[INFO] Shape after cleaning:', df.shape)
+            dw=DW(trl,tel,idm,sc,ff,{'sl':a.seq_length,'tc':a.target_column,'dc':dc,'ts':a.test_split,'bs':a.batch_size})
+            ensure_dir(a.processed_data)
+            with open(a.processed_data,'wb') as f: cloudpickle.dump(dw,f)
             
-            print('[STEP 8/13] Encoding categorical features...')
-            exclude_cols = [args.target_column]
-            if date_column:
-                exclude_cols.append(date_column)
+            pp=TSP()
+            pp.fit(df,{'tc':a.target_column,'dc':dc,'oc':oc,'sl':a.seq_length,'lp':lp,'rw':rw,'cl':el,'cr':er,'cd':ed,'ut':a.unique_threshold})
+            pp.sc=sc;pp.ce=ei;pp.fo=ff;pp.du=du
+            pp.sv(a.preprocessor)
             
-            df, encoding_info = encode_categorical_safe(df, exclude_cols=exclude_cols)
-            print('[INFO] Shape after encoding:', df.shape)
+            md={'ts':datetime.utcnow().isoformat()+'Z','dc':dc,'tc':a.target_column,'nf':len(ff),'sl':a.seq_length,'split':a.test_split,
+                'bs':a.batch_size,'ut':a.unique_threshold,'lp':lp,'rw':rw,'cl':el,'cr':er,'cd':ed,'idm':idm,
+                'sh':{'xtr':list(Xtr.shape),'ytr':list(ytr.shape),'xte':list(Xte.shape),'yte':list(yte.shape)},
+                'dr':{'st':str(df[dc].min()),'en':str(df[dc].max())},'ish':list(ish),'fsh':list(df.shape),'du':du,'cm':cm}
+            ensure_dir(a.engineering_metadata)
+            with open(a.engineering_metadata,'w') as f: json.dump(md,f,indent=2)
             
-            print('[STEP 9/13] Dropping high-uniqueness columns (IDs, emails, etc.)...')
-            final_feature_cols = [c for c in df.columns 
-                                 if c not in ([args.target_column] + ([date_column] if date_column else []))]
-            
-            df, final_feature_cols, dropped_unique_cols, uniqueness_report = drop_high_uniqueness_columns(
-                df, final_feature_cols, args.unique_threshold
-            )
-            print('[INFO] Shape after dropping unique columns:', df.shape)
-            
-            print('[STEP 10/13] Preparing features and target...')
-            X = df[final_feature_cols].values
-            y = df[args.target_column].values
-            print('[INFO] Features shape:', X.shape)
-            print('[INFO] Target shape:', y.shape)
-            
-            print('[STEP 11/13] Scaling features...')
-            scaler = MinMaxScaler()
-            X_scaled = scaler.fit_transform(X)
-            print('[INFO] Scaling complete')
-            
-            print('[STEP 12/13] Creating sequences (window size=' + str(args.seq_length) + ')...')
-            X_seq, y_seq = create_sequences(X_scaled, y, args.seq_length)
-            print('[INFO] Sequence shape:', X_seq.shape)
-            print('[INFO] Labels shape:', y_seq.shape)
-            
-            print('[STEP 13/13] Splitting into train/test (chronological, no shuffle)...')
-            train_size = int(len(X_seq) * (1 - args.test_split))
-            
-            X_train = X_seq[:train_size]
-            y_train = y_seq[:train_size]
-            X_test = X_seq[train_size:]
-            y_test = y_seq[train_size:]
-            
-            print('[INFO] Train shape:', X_train.shape, 'Test shape:', X_test.shape)
-            print('[INFO] Train samples:', len(X_train), 'Test samples:', len(X_test))
-            
-            X_train = torch.tensor(X_train, dtype=torch.float32)
-            y_train = torch.tensor(y_train, dtype=torch.float32).unsqueeze(1)
-            X_test = torch.tensor(X_test, dtype=torch.float32)
-            y_test = torch.tensor(y_test, dtype=torch.float32).unsqueeze(1)
-            
-            train_dataset = TensorDataset(X_train, y_train)
-            test_dataset = TensorDataset(X_test, y_test)
-            
-            train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=False)
-            test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False)
-            
-            input_dim = X_train.shape[2]
-            print('[INFO] Input dimension (features):', input_dim)
-            
-            print('[STEP 14/14] Saving outputs...')
-            
-            data_wrapper = DataWrapper(
-                train_loader=train_loader,
-                test_loader=test_loader,
-                input_dim=input_dim,
-                scaler=scaler,
-                feature_columns=final_feature_cols,
-                metadata={
-                    'seq_length': args.seq_length,
-                    'target_column': args.target_column,
-                    'date_column': date_column,
-                    'train_samples': len(X_train),
-                    'test_samples': len(X_test),
-                    'train_shape': list(X_train.shape),
-                    'test_shape': list(X_test.shape),
-                    'batch_size': args.batch_size,
-                    'test_split': args.test_split
-                }
-            )
-            
-            ensure_dir_for(args.processed_data)
-            with open(args.processed_data, 'wb') as f:
-                cloudpickle.dump(data_wrapper, f)
-            print('[INFO] Saved processed_data to:', args.processed_data)
-            
-            preprocessor = TimeSeriesPreprocessor()
-            preprocessor.fit(df, {
-                'target_column': args.target_column,
-                'date_column': date_column,
-                'seq_length': args.seq_length,
-                'lag_periods': lag_periods,
-                'rolling_windows': rolling_windows,
-                'create_lags': enable_lags,
-                'create_rolling_stats': enable_rolling_stats,
-                'create_diff_features': enable_diff_features,
-                'unique_threshold': args.unique_threshold
-            })
-            preprocessor.scaler = scaler
-            preprocessor.categorical_encodings = encoding_info
-            preprocessor.feature_order = final_feature_cols
-            
-            preprocessor.save(args.preprocessor)
-            print('[INFO] Saved preprocessor to:', args.preprocessor)
-            
-            print('[STEP 15/15] Saving metadata...')
-            metadata = {
-                'timestamp': datetime.utcnow().isoformat() + 'Z',
-                'date_column': date_column,
-                'date_column_auto_detected': True,
-                'target_column': args.target_column,
-                'feature_columns': final_feature_cols,
-                'n_features': len(final_feature_cols),
-                'seq_length': args.seq_length,
-                'test_split': args.test_split,
-                'batch_size': args.batch_size,
-                'unique_threshold': args.unique_threshold,
-                'lag_periods': lag_periods,
-                'rolling_windows': rolling_windows,
-                'create_lags': enable_lags,
-                'create_rolling_stats': enable_rolling_stats,
-                'create_diff_features': enable_diff_features,
-                'shapes': {
-                    'X_train': list(X_train.shape),
-                    'y_train': list(y_train.shape),
-                    'X_test': list(X_test.shape),
-                    'y_test': list(y_test.shape)
-                },
-                'input_dim': input_dim,
-                'date_range': {
-                    'start': str(df[date_column].min()) if date_column else None,
-                    'end': str(df[date_column].max()) if date_column else None
-                },
-                'initial_shape': list(initial_shape),
-                'final_shape': list(df.shape),
-                'rows_dropped_for_sequences': args.seq_length,
-                'dropped_unique_columns': dropped_unique_cols,
-                'uniqueness_report': uniqueness_report,
-                'features_created': {
-                    'lag_features': len(lag_periods) * len(feature_cols) if enable_lags else 0,
-                    'rolling_features': len(rolling_windows) * 4 * len(feature_cols) if enable_rolling_stats else 0,
-                    'diff_features': 2 * len(feature_cols) if enable_diff_features else 0
-                },
-                'categorical_encodings': encoding_info,
-                'cleaning_metadata': cleaning_meta
-            }
-            
-            ensure_dir_for(args.engineering_metadata)
-            with open(args.engineering_metadata, 'w') as f:
-                json.dump(metadata, f, indent=2)
-            print('[INFO] Saved metadata to:', args.engineering_metadata)
-            
-            print("="*80)
-            print("TIME SERIES PREPROCESSING COMPLETE")
-            print("="*80)
-            print('Input shape:', initial_shape)
-            print('Final shape:', df.shape)
-            print('Train sequences:', X_train.shape)
-            print('Test sequences:', X_test.shape)
-            print('Input dimension:', input_dim)
-            print('Sequence length:', args.seq_length)
-            print('Batch size:', args.batch_size)
-            print('Target column:', args.target_column)
-            print('Date column (auto-detected):', date_column if date_column else 'None')
-            print('Dropped unique columns:', len(dropped_unique_cols))
-            print("="*80)
-            print("SUCCESS: All outputs saved")
-            print("="*80)
-            
-        except Exception as exc:
-            print('ERROR:', str(exc), file=sys.stderr)
+            print('='*80+' SUCCESS '+'='*80)
+            print('Train:',Xtr.shape,'Test:',Xte.shape,'Dim:',idm)
+        except Exception as e:
+            print('ERROR:',str(e),file=sys.stderr)
             traceback.print_exc()
             sys.exit(1)
     args:
