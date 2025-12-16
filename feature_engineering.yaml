@@ -1,4 +1,4 @@
-name: Time Series Preprocessing v6.1
+name: Time Series Preprocessing v6.2
 inputs:
   - {name: cleaned_data, type: Dataset}
   - {name: cleaning_metadata, type: Data}
@@ -298,9 +298,6 @@ implementation:
                 
                 if nan_cols:
                     df = df.drop(columns=nan_cols)
-                    # Update feature list
-                    ff = [c for c in ff if c not in nan_cols]
-                
                 # Forward and backward fill remaining NaNs
                 df = df.bfill().ffill()
                 
