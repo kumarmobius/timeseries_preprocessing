@@ -1,9 +1,10 @@
-name: Time Series Preprocessing v6.5
+name: Time Series Preprocessing v7
 inputs:
   - {name: cleaned_data, type: Dataset}
   - {name: cleaning_metadata, type: Data}
   - {name: target_column, type: String}
   - {name: feature_columns, type: String, optional: true, default: ""}
+  - {name: column_ignore, type: String, optional: true, default: ""}
   - {name: seq_length, type: Integer, optional: true, default: "10"}
   - {name: test_split, type: Float, optional: true, default: "0.2"}
   - {name: batch_size, type: Integer, optional: true, default: "32"}
@@ -242,6 +243,7 @@ implementation:
                 self.sc=None;self.fc=[];self.tc=None;self.dc=None;self.oc=None;self.sl=None
                 self.lp=[];self.rw=[];self.ce={};self.fo=[];self.cl=True;self.cr=True;self.cd=True
                 self.ut=0.95;self.du=[];self.cyc=[];self.ccyc=False;self.st='minmax';self.ur={}
+                self.ig=set()
                 
             def fit(self,df,cfg):
                 self.tc=cfg['tc'];self.dc=cfg.get('dc');self.oc=cfg.get('oc');self.sl=cfg['sl']
@@ -251,12 +253,24 @@ implementation:
                 ex=[self.tc]
                 if self.dc: ex.append(self.dc)
                 if self.oc: ex.append(self.oc)
-                self.fc=[c for c in df.columns if c not in ex]
+                self.fc = [c for c in df.columns if c not in ex and c not in self.ig]
                 return self
                 
             def tr(self,df,tm=False):
                 print(f'[TRANSFORM] Mode: {"TRAIN" if tm else "INFERENCE"}')
                 df=df.copy()
+                # DROP ignored columns (TRAIN + INFERENCE)
+                if hasattr(self, 'ig') and self.ig:
+                    drop_now = [c for c in self.ig if c in df.columns]
+                    if drop_now:
+                        print(f'[IGNORE] Dropping ignored columns in transform: {drop_now}')
+                        df = df.drop(columns=drop_now)
+
+                if getattr(self, 'ig', None):
+                  drop_now = [c for c in self.ig if c in df.columns]
+                  if drop_now:
+                      print(f'[IGNORE] Dropping ignored columns in transform: {drop_now}')
+                      df = df.drop(columns=drop_now)
                 
                 # Auto-detect temporal column
                 ddc,dtc=self.dc,None
@@ -327,6 +341,11 @@ implementation:
                 ex=[self.tc]
                 if self.dc: ex.append(self.dc)
                 if self.oc and self.oc in df.columns: ex.append(self.oc)
+                
+                # Ensure ignored columns are excluded everywhere
+                if hasattr(self, 'ig') and self.ig:
+                    ex.extend([c for c in self.ig if c not in ex])
+
                 
                 if tm:
                     df,self.ce=enc_cat_tr(df,ex)
@@ -440,7 +459,12 @@ implementation:
         p.add_argument('--processed_data',required=True)
         p.add_argument('--preprocessor',required=True)
         p.add_argument('--engineering_metadata',required=True)
+        p.add_argument('--column_ignore', default="")
         a=p.parse_args()
+
+        ignore_cols = set(parse_csv(a.column_ignore, str))
+        print(f'[IGNORE] Columns to ignore: {list(ignore_cols)}')
+
 
         try:
             print('='*80)
@@ -455,6 +479,12 @@ implementation:
             rw=parse_csv(a.rolling_windows,int)
             
             df=pd.read_parquet(a.cleaned_data)
+            
+            existing_ignore = [c for c in ignore_cols if c in df.columns]
+            if existing_ignore:
+                print(f'[IGNORE] Dropping columns at load: {existing_ignore}')
+                df = df.drop(columns=existing_ignore)
+                
             print(f'[LOAD] Data: {df.shape}')
             print(f'[LOAD] Columns: {list(df.columns[:5])}...')
             
@@ -481,11 +511,16 @@ implementation:
             
             # Feature columns
             if a.feature_columns.strip():
-                fc=parse_csv(a.feature_columns,str)
+                fc = parse_csv(a.feature_columns, str)
             else:
-                ex=[a.target_column,dc]
+                ex=[a.target_column, dc]
                 if oc: ex.append(oc)
-                fc=[c for c in df.columns if c not in ex]
+                fc = [c for c in df.columns if c not in ex]
+            
+            # remove ignored columns from fc (so base feature count excludes them)
+            if ignore_cols:
+                fc = [c for c in fc if c not in ignore_cols]
+
             
             print(f'[FEATURES] {len(fc)} base features')
             
@@ -493,7 +528,8 @@ implementation:
             pp.fit(df,{
                 'tc':a.target_column,'dc':dc,'oc':oc,'sl':a.seq_length,
                 'lp':lp,'rw':rw,'cl':el,'cr':er,'cd':ed,'ccyc':ecyc,
-                'ut':a.unique_threshold,'st':a.scaler_type
+                'ut':a.unique_threshold,'st':a.scaler_type,
+                'ig': list(ignore_cols)
             })
             
             Xq,yq=pp.tr(df,tm=True)
@@ -539,6 +575,7 @@ implementation:
                 'ut':a.unique_threshold,'scaler':a.scaler_type,
                 'lp':lp,'rw':rw,
                 'flags':{'lag':el,'roll':er,'diff':ed,'cyclic':ecyc},
+                'ignored_columns': list(ignore_cols),
                 'idm':idm,
                 'shapes':{
                     'train':list(Xtr.shape),
@@ -603,6 +640,8 @@ implementation:
       - {inputValue: lag_periods}
       - --rolling_windows
       - {inputValue: rolling_windows}
+      - --column_ignore
+      - {inputValue: column_ignore}
       - --create_lags
       - {inputValue: create_lags}
       - --create_rolling_stats
