@@ -1,0 +1,124 @@
+name: Upload to CDN
+description: Uploads datasets and preprocessing artifacts to a CDN and outputs public URLs.
+inputs:
+  - {name: test_data, type: Dataset, description: "Test dataset file"}
+  - {name: preprocessed_data, type: Dataset, description: "Preprocessed dataset file"}
+  - {name: preprocesser_pickle, type: Data, description: "Preprocesser pickle file"}
+  - {name: preprocesser_metadata, type: Data, description: "Preprocesser metadata JSON"}
+  - {name: bearer_token, type: string, description: "Bearer token for CDN authentication"}
+  - {name: domain, type: String, description: "Upload service base domain"}
+  - {name: get_cdn, type: String, description: "Public CDN base domain"}
+
+outputs:
+  - {name: test_data_cdn_url, type: String, description: "CDN URL for test data"}
+  - {name: preprocessed_data_cdn_url, type: String, description: "CDN URL for preprocessed data"}
+  - {name: preprocesser_pickle_cdn_url, type: String, description: "CDN URL for preprocesser pickle"}
+  - {name: preprocesser_metadata_cdn_url, type: String, description: "CDN URL for preprocesser metadata"}
+
+implementation:
+  container:
+    image: python:3.8-slim
+    command:
+      - sh
+      - -ec
+      - |
+        if ! command -v curl >/dev/null 2>&1; then
+          apt-get update >/dev/null && apt-get install -y curl >/dev/null
+        fi
+        exec "$0" "$@"
+      - python3
+      - -u
+      - -c
+      - |
+        import argparse
+        import subprocess
+        import json
+        import os
+
+        parser = argparse.ArgumentParser()
+
+        parser.add_argument('--test_data', type=str, required=True)
+        parser.add_argument('--preprocessed_data', type=str, required=True)
+        parser.add_argument('--preprocesser_pickle', type=str, required=True)
+        parser.add_argument('--preprocesser_metadata', type=str, required=True)
+
+        parser.add_argument('--bearer_token', type=str, required=True)
+        parser.add_argument('--domain', type=str, required=True)
+        parser.add_argument('--get_cdn', type=str, required=True)
+
+        parser.add_argument('--test_data_cdn_url', type=str, required=True)
+        parser.add_argument('--preprocessed_data_cdn_url', type=str, required=True)
+        parser.add_argument('--preprocesser_pickle_cdn_url', type=str, required=True)
+        parser.add_argument('--preprocesser_metadata_cdn_url', type=str, required=True)
+
+        args = parser.parse_args()
+
+        with open(args.bearer_token, "r") as f:
+            bearer_token = f.read().strip()
+
+        upload_url = (
+            f"{args.domain}"
+            "/mobius-content-service/v1.0/content/upload"
+            "?filePathAccess=private&filePath=%2Fbottle%2Flimka%2Fsoda%2F"
+        )
+
+        def upload(file_path, output_path, prefix):
+            filename = os.path.basename(file_path)
+            cdn_name = f"{prefix}_{filename}"
+
+            cmd = [
+                "curl",
+                "--location", upload_url,
+                "--header", f"Authorization: Bearer {bearer_token}",
+                "--form", f"file=@{file_path}",
+                "--fail",
+                "--show-error"
+            ]
+
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                check=True
+            )
+
+            response = json.loads(result.stdout.decode())
+            relative_url = response.get("cdnUrl")
+
+            if not relative_url:
+                raise RuntimeError(f"cdnUrl missing in response: {response}")
+
+            full_url = f"{args.get_cdn}{relative_url}"
+
+            os.makedirs(os.path.dirname(output_path), exist_ok=True)
+            with open(output_path, "w") as f:
+                f.write(full_url)
+
+            return full_url
+
+        upload(args.test_data, args.test_data_cdn_url, "test_data")
+        upload(args.preprocessed_data, args.preprocessed_data_cdn_url, "preprocessed_data")
+        upload(args.preprocesser_pickle, args.preprocesser_pickle_cdn_url, "preprocesser_pickle")
+        upload(args.preprocesser_metadata, args.preprocesser_metadata_cdn_url, "preprocesser_metadata")
+    args:
+      - --test_data
+      - {inputPath: test_data}
+      - --preprocessed_data
+      - {inputPath: preprocessed_data}
+      - --preprocesser_pickle
+      - {inputPath: preprocesser_pickle}
+      - --preprocesser_metadata
+      - {inputPath: preprocesser_metadata}
+      - --bearer_token
+      - {inputPath: bearer_token}
+      - --domain
+      - {inputValue: domain}
+      - --get_cdn
+      - {inputValue: get_cdn}
+      - --test_data_cdn_url
+      - {outputPath: test_data_cdn_url}
+      - --preprocessed_data_cdn_url
+      - {outputPath: preprocessed_data_cdn_url}
+      - --preprocesser_pickle_cdn_url
+      - {outputPath: preprocesser_pickle_cdn_url}
+      - --preprocesser_metadata_cdn_url
+      - {outputPath: preprocesser_metadata_cdn_url}
