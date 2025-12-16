@@ -1,4 +1,4 @@
-name: Time Series Preprocessing v6.0
+name: Time Series Preprocessing v6.1
 inputs:
   - {name: cleaned_data, type: Dataset}
   - {name: cleaning_metadata, type: Data}
@@ -286,15 +286,39 @@ implementation:
                 
                 # Handle inf/nan
                 print(f'[CLEAN] Handling inf/nan values')
-                df=df.replace([np.inf,-np.inf],np.nan).bfill().ffill()
-                before=len(df)
-                df=df.dropna()
-                if len(df)<before:
-                    print(f'[CLEAN] Dropped {before-len(df)} rows with NaN')
+                df=df.replace([np.inf,-np.inf],np.nan)
                 
-                # Validation
-                if len(df)<=self.sl:
-                    raise ValueError(f'Insufficient data: {len(df)} rows, need >{self.sl}')
+                # Check which columns have too many NaNs
+                nan_cols = []
+                for col in df.columns:
+                    nan_pct = df[col].isna().sum() / len(df)
+                    if nan_pct > 0.5:  # If more than 50% NaN
+                        nan_cols.append(col)
+                        print(f'[CLEAN] Dropping column {col} ({nan_pct:.1%} NaN)')
+                
+                if nan_cols:
+                    df = df.drop(columns=nan_cols)
+                    # Update feature list
+                    ff = [c for c in ff if c not in nan_cols]
+                
+                # Forward and backward fill remaining NaNs
+                df = df.bfill().ffill()
+                
+                # Only drop rows if still have NaNs
+                before = len(df)
+                df = df.dropna()
+                if len(df) < before:
+                    print(f'[CLEAN] Dropped {before-len(df)} rows with remaining NaN')
+                
+                # Validation with better error message
+                if len(df) <= self.sl:
+                    date_range = (df[self.dc].max() - df[self.dc].min()).total_seconds()
+                    raise ValueError(
+                        f'Insufficient data: {len(df)} rows (need >{self.sl}). '
+                        f'Date range is only {date_range:.1f} seconds. '
+                        f'Reduce seq_length, lag_periods, and rolling_windows, '
+                        f'or fix your timestamp column (currently shows Unix epoch 1970).'
+                    )
                 
                 # Categorical encoding
                 ex=[self.tc]
