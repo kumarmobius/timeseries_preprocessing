@@ -1,4 +1,4 @@
-name: Data Splitter v2.0
+name: Data Splitter v2.1
 description: Reads data from file and splits into train/test sets with multiple format support
 inputs:
   - {name: input_data, type: Dataset, description: 'Input data file (JSON/CSV/Parquet supported)'}
@@ -176,7 +176,7 @@ implementation:
                 logger.warning("Duplicate rows: %d (%.1f%%)", n_dupes, n_dupes/len(df)*100)
             
             logger.info("Sample data:")
-            logger.info("\n%s", df.head(3).to_string())
+            logger.info("%s", df.head(3).to_string())
             
             # Step 3: Validate test_split
             test_size = args.test_split
