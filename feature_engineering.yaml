@@ -1,4 +1,4 @@
-name: Time Series Preprocessing v6.4
+name: Time Series Preprocessing v6.5
 inputs:
   - {name: cleaned_data, type: Dataset}
   - {name: cleaning_metadata, type: Data}
@@ -177,14 +177,15 @@ implementation:
                 nu=df[c].nunique()
                 if nu<=10:
                     d=pd.get_dummies(df[c],prefix=c,drop_first=False)
+                    # FIX: Convert all dummy columns to float64
+                    for dcol in d.columns:
+                        d[dcol]=d[dcol].astype(np.float64)
                     df=pd.concat([df.drop(columns=[c]),d],axis=1)
                     ei[c]={'type':'oh','cols':list(d.columns)}
                     print(f'[ENCODE] One-hot: {c} -> {nu} columns')
                 else:
                     fm=df[c].value_counts().to_dict()
-                    df[c]=df[c].map(fm).fillna(0)
-                    # FIX: Explicitly convert to numeric type
-                    df[c]=pd.to_numeric(df[c], errors='coerce').fillna(0).astype(np.float64)
+                    df[c]=df[c].map(fm).fillna(0).astype(np.float64)
                     ei[c]={'type':'freq','map':{str(k):int(v) for k,v in list(fm.items())[:100]}}
                     print(f'[ENCODE] Frequency: {c} ({nu} unique)')
             return df,ei
@@ -200,11 +201,12 @@ implementation:
                     d=pd.get_dummies(df[c],prefix=c,drop_first=False)
                     for e in ec:
                         if e not in d.columns: d[e]=0
+                    # FIX: Convert all columns to float64
+                    for dcol in d.columns:
+                        d[dcol]=d[dcol].astype(np.float64)
                     df=pd.concat([df.drop(columns=[c]),d[ec]],axis=1)
                 elif inf['type']=='freq':
-                    df[c]=df[c].map(inf['map']).fillna(0)
-                    # FIX: Explicitly convert to numeric type
-                    df[c]=pd.to_numeric(df[c], errors='coerce').fillna(0).astype(np.float64)
+                    df[c]=df[c].map(inf['map']).fillna(0).astype(np.float64)
             return df
 
         def drop_uniq(df,fc,th):
@@ -333,6 +335,12 @@ implementation:
                 
                 # Get feature columns
                 ff=[c for c in df.columns if c not in ex]
+                
+                # FINAL SAFETY: Force all features to numeric
+                for col in ff:
+                    if col in df.columns and not pd.api.types.is_numeric_dtype(df[col]):
+                        print(f'[FORCE-NUMERIC] Converting {col} (type: {df[col].dtype})')
+                        df[col]=pd.to_numeric(df[col],errors='coerce').fillna(0).astype(np.float64)
                 
                 # Additional check: ensure all feature columns are numeric
                 non_numeric = []
