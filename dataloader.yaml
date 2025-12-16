@@ -1,6 +1,6 @@
 name: Data splitter v1.0
 inputs:
-  - {name: json_data, type: String, description: 'Complete JSON data as string'}
+  - {name: json_data, type: Dataset, description: 'Complete JSON data as string'}
   - {name: split_size, type: Integer, default: "15", description: 'Test split size as integer percent (default 15) or fraction (e.g. 0.2)'}
 outputs:
   - {name: train_loader, type: Dataset}
