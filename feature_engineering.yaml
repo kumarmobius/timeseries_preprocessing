@@ -1,4 +1,4 @@
-name: Time Series Preprocessing v6.3
+name: Time Series Preprocessing v6.4
 inputs:
   - {name: cleaned_data, type: Dataset}
   - {name: cleaning_metadata, type: Data}
@@ -183,6 +183,8 @@ implementation:
                 else:
                     fm=df[c].value_counts().to_dict()
                     df[c]=df[c].map(fm).fillna(0)
+                    # FIX: Explicitly convert to numeric type
+                    df[c]=pd.to_numeric(df[c], errors='coerce').fillna(0).astype(np.float64)
                     ei[c]={'type':'freq','map':{str(k):int(v) for k,v in list(fm.items())[:100]}}
                     print(f'[ENCODE] Frequency: {c} ({nu} unique)')
             return df,ei
@@ -201,6 +203,8 @@ implementation:
                     df=pd.concat([df.drop(columns=[c]),d[ec]],axis=1)
                 elif inf['type']=='freq':
                     df[c]=df[c].map(inf['map']).fillna(0)
+                    # FIX: Explicitly convert to numeric type
+                    df[c]=pd.to_numeric(df[c], errors='coerce').fillna(0).astype(np.float64)
             return df
 
         def drop_uniq(df,fc,th):
