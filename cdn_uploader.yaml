@@ -1,26 +1,19 @@
-name: Upload to CDN v2
-description: Uploads datasets and preprocessing artifacts to a CDN and outputs public URLs (uploads a file only if provided).
+name: Upload to CDN
+description: Uploads datasets and preprocessing artifacts to a CDN and outputs public URLs.
 inputs:
-  - {name: train_data, type: Dataset, description: "Train dataset file (optional, default {})"}
-  - {name: test_data, type: Dataset, description: "Test dataset file (optional, default {})"}
-  - {name: preprocessed_data, type: Dataset, description: "Preprocessed dataset file (optional, default {})"}
-  - {name: preprocesser_pickle, type: Data, description: "Preprocesser pickle file (optional, default {})"}
-  - {name: preprocesser_metadata, type: Data, description: "Preprocesser metadata JSON (optional, default {})"}
-  - {name: feature_selector, type: Data, description: "Optional feature selector pickle file (optional, default {})"}
-  - {name: cleaning_metadata, type: Data, description: "Optional cleaning metadata JSON (optional, default {})"}
-  - {name: bearer_token, type: string, description: "Bearer token for CDN authentication (path to token file)"}
+  - {name: test_data, type: Dataset, description: "Test dataset file"}
+  - {name: preprocessed_data, type: Dataset, description: "Preprocessed dataset file"}
+  - {name: preprocesser_pickle, type: Data, description: "Preprocesser pickle file"}
+  - {name: preprocesser_metadata, type: Data, description: "Preprocesser metadata JSON"}
+  - {name: bearer_token, type: string, description: "Bearer token for CDN authentication"}
   - {name: domain, type: String, description: "Upload service base domain"}
   - {name: get_cdn, type: String, description: "Public CDN base domain"}
 
 outputs:
-  - {name: train_data_cdn_url, type: String, description: "CDN URL or original value for train data"}
-  - {name: test_data_cdn_url, type: String, description: "CDN URL or original value for test data"}
-  - {name: preprocessed_data_cdn_url, type: String, description: "CDN URL or original value for preprocessed data"}
-  - {name: preprocesser_pickle_cdn_url, type: String, description: "CDN URL or original value for preprocesser pickle"}
-  - {name: preprocesser_metadata_cdn_url, type: String, description: "CDN URL or original value for preprocesser metadata"}
-  - {name: feature_selector_cdn_url, type: String, description: "CDN URL or original value for feature selector pickle"}
-  - {name: cleaning_metadata_cdn_url, type: String, description: "CDN URL or original value for cleaning metadata"}
-  - {name: schema_json, type: String, description: "Combined JSON with train/test/preprocessed/preprocessor/... + epoch timestamp (number)"}
+  - {name: test_data_cdn_url, type: String, description: "CDN URL for test data"}
+  - {name: preprocessed_data_cdn_url, type: String, description: "CDN URL for preprocessed data"}
+  - {name: preprocesser_pickle_cdn_url, type: String, description: "CDN URL for preprocesser pickle"}
+  - {name: preprocesser_metadata_cdn_url, type: String, description: "CDN URL for preprocesser metadata"}
 
 implementation:
   container:
@@ -41,38 +34,25 @@ implementation:
         import subprocess
         import json
         import os
-        import sys
-        import time
 
         parser = argparse.ArgumentParser()
 
-        # Inputs default to "{}" meaning "not provided by parent"
-        parser.add_argument('--train_data', type=str, required=False, default="{}")
-        parser.add_argument('--test_data', type=str, required=False, default="{}")
-        parser.add_argument('--preprocessed_data', type=str, required=False, default="{}")
-        parser.add_argument('--preprocesser_pickle', type=str, required=False, default="{}")
-        parser.add_argument('--preprocesser_metadata', type=str, required=False, default="{}")
-        parser.add_argument('--feature_selector', type=str, required=False, default="{}")
-        parser.add_argument('--cleaning_metadata', type=str, required=False, default="{}")
+        parser.add_argument('--test_data', type=str, required=True)
+        parser.add_argument('--preprocessed_data', type=str, required=True)
+        parser.add_argument('--preprocesser_pickle', type=str, required=True)
+        parser.add_argument('--preprocesser_metadata', type=str, required=True)
 
-        # Required config/auth
         parser.add_argument('--bearer_token', type=str, required=True)
         parser.add_argument('--domain', type=str, required=True)
         parser.add_argument('--get_cdn', type=str, required=True)
 
-        # Output paths
-        parser.add_argument('--train_data_cdn_url', type=str, required=True)
         parser.add_argument('--test_data_cdn_url', type=str, required=True)
         parser.add_argument('--preprocessed_data_cdn_url', type=str, required=True)
         parser.add_argument('--preprocesser_pickle_cdn_url', type=str, required=True)
         parser.add_argument('--preprocesser_metadata_cdn_url', type=str, required=True)
-        parser.add_argument('--feature_selector_cdn_url', type=str, required=True)
-        parser.add_argument('--cleaning_metadata_cdn_url', type=str, required=True)
-        parser.add_argument('--schema_json', type=str, required=True)
 
         args = parser.parse_args()
 
-        # Read bearer token (file path provided)
         with open(args.bearer_token, "r") as f:
             bearer_token = f.read().strip()
 
@@ -82,8 +62,10 @@ implementation:
             "?filePathAccess=private&filePath=%2Fbottle%2Flimka%2Fsoda%2F"
         )
 
-        def curl_upload(file_path):
+        def upload(file_path, output_path, prefix):
             filename = os.path.basename(file_path)
+            cdn_name = f"{prefix}_{filename}"
+
             cmd = [
                 "curl",
                 "--location", upload_url,
@@ -92,86 +74,46 @@ implementation:
                 "--fail",
                 "--show-error"
             ]
-            result = subprocess.run(cmd, capture_output=True, check=True)
+
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                check=True
+            )
+
             response = json.loads(result.stdout.decode())
             relative_url = response.get("cdnUrl")
+
             if not relative_url:
                 raise RuntimeError(f"cdnUrl missing in response: {response}")
-            return f"{args.get_cdn}{relative_url}"
 
-        def resolve_and_maybe_upload(input_value, output_path):
-            if not input_value or input_value.strip() == "{}":
-                resolved = "{}"
-            elif os.path.isfile(input_value):
-                try:
-                    resolved = curl_upload(input_value)
-                except subprocess.CalledProcessError as e:
-                    sys.stderr.write(f"Upload failed for {input_value}: returncode={e.returncode}\n")
-                    sys.stderr.write(e.stderr.decode() if e.stderr else "")
-                    raise
-            else:
-                # Parent provided a non-file value (possibly already an URL) -> pass-through
-                resolved = input_value
+            full_url = f"{args.get_cdn}{relative_url}"
 
-            # ensure output dir exists before writing
-            outdir = os.path.dirname(output_path)
-            if outdir:
-                os.makedirs(outdir, exist_ok=True)
+            os.makedirs(os.path.dirname(output_path), exist_ok=True)
             with open(output_path, "w") as f:
-                f.write(resolved)
-            return resolved
+                f.write(full_url)
 
-        # Process each input (conditionally upload)
-        train_val = resolve_and_maybe_upload(args.train_data, args.train_data_cdn_url)
-        test_val = resolve_and_maybe_upload(args.test_data, args.test_data_cdn_url)
-        preprocessed_val = resolve_and_maybe_upload(args.preprocessed_data, args.preprocessed_data_cdn_url)
-        preprocesser_pickle_val = resolve_and_maybe_upload(args.preprocesser_pickle, args.preprocesser_pickle_cdn_url)
-        preprocesser_metadata_val = resolve_and_maybe_upload(args.preprocesser_metadata, args.preprocesser_metadata_cdn_url)
-        feature_selector_val = resolve_and_maybe_upload(args.feature_selector, args.feature_selector_cdn_url)
-        cleaning_metadata_val = resolve_and_maybe_upload(args.cleaning_metadata, args.cleaning_metadata_cdn_url)
+            return full_url
 
-        # Build schema JSON with the exact keys you requested; timestamp is epoch integer
-        schema = {
-            "train_data_cdn": train_val,
-            "test_data_cdn": test_val,
-            "preprocessed_data_cdn": preprocessed_val,
-            "preprocessor_cdn": preprocesser_pickle_val,
-            "preprocessor_metadata_cdn": preprocesser_metadata_val,
-            "feature_selector_cdn": feature_selector_val,
-            "cleaning_metadata_cdn": cleaning_metadata_val,
-            "timestamp": int(time.time())
-        }
-
-        # Write schema_json output
-        schema_outdir = os.path.dirname(args.schema_json)
-        if schema_outdir:
-            os.makedirs(schema_outdir, exist_ok=True)
-        with open(args.schema_json, "w") as f:
-            json.dump(schema, f)
-
+        upload(args.test_data, args.test_data_cdn_url, "test_data")
+        upload(args.preprocessed_data, args.preprocessed_data_cdn_url, "preprocessed_data")
+        upload(args.preprocesser_pickle, args.preprocesser_pickle_cdn_url, "preprocesser_pickle")
+        upload(args.preprocesser_metadata, args.preprocesser_metadata_cdn_url, "preprocesser_metadata")
     args:
-      - --train_data
-      - {inputValue: train_data}
       - --test_data
-      - {inputValue: test_data}
+      - {inputPath: test_data}
       - --preprocessed_data
-      - {inputValue: preprocessed_data}
+      - {inputPath: preprocessed_data}
       - --preprocesser_pickle
-      - {inputValue: preprocesser_pickle}
+      - {inputPath: preprocesser_pickle}
       - --preprocesser_metadata
-      - {inputValue: preprocesser_metadata}
-      - --feature_selector
-      - {inputValue: feature_selector}
-      - --cleaning_metadata
-      - {inputValue: cleaning_metadata}
+      - {inputPath: preprocesser_metadata}
       - --bearer_token
       - {inputPath: bearer_token}
       - --domain
       - {inputValue: domain}
       - --get_cdn
       - {inputValue: get_cdn}
-      - --train_data_cdn_url
-      - {outputPath: train_data_cdn_url}
       - --test_data_cdn_url
       - {outputPath: test_data_cdn_url}
       - --preprocessed_data_cdn_url
@@ -180,9 +122,3 @@ implementation:
       - {outputPath: preprocesser_pickle_cdn_url}
       - --preprocesser_metadata_cdn_url
       - {outputPath: preprocesser_metadata_cdn_url}
-      - --feature_selector_cdn_url
-      - {outputPath: feature_selector_cdn_url}
-      - --cleaning_metadata_cdn_url
-      - {outputPath: cleaning_metadata_cdn_url}
-      - --schema_json
-      - {outputPath: schema_json}
