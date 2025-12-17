@@ -1,4 +1,4 @@
-name: Upload to CDN v1
+name: Upload to CDN v2
 description: Uploads datasets and preprocessing artifacts to a CDN and outputs public URLs (uploads a file only if provided).
 inputs:
   - {name: train_data, type: Dataset, description: "Train dataset file (optional, default {})"}
@@ -151,19 +151,19 @@ implementation:
 
     args:
       - --train_data
-      - {inputPath: train_data}
+      - {inputValue: train_data}
       - --test_data
-      - {inputPath: test_data}
+      - {inputValue: test_data}
       - --preprocessed_data
-      - {inputPath: preprocessed_data}
+      - {inputValue: preprocessed_data}
       - --preprocesser_pickle
-      - {inputPath: preprocesser_pickle}
+      - {inputValue: preprocesser_pickle}
       - --preprocesser_metadata
-      - {inputPath: preprocesser_metadata}
+      - {inputValue: preprocesser_metadata}
       - --feature_selector
-      - {inputPath: feature_selector}
+      - {inputValue: feature_selector}
       - --cleaning_metadata
-      - {inputPath: cleaning_metadata}
+      - {inputValue: cleaning_metadata}
       - --bearer_token
       - {inputPath: bearer_token}
       - --domain
