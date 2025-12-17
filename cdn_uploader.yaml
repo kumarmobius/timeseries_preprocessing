@@ -1,19 +1,21 @@
 name: Upload to CDN
-description: Uploads datasets and preprocessing artifacts to a CDN and outputs public URLs.
+description: Uploads datasets and preprocessing artifacts to a CDN and outputs public URLs (uploads a file only if provided).
 inputs:
   - {name: test_data, type: Dataset, description: "Test dataset file"}
   - {name: preprocessed_data, type: Dataset, description: "Preprocessed dataset file"}
   - {name: preprocesser_pickle, type: Data, description: "Preprocesser pickle file"}
   - {name: preprocesser_metadata, type: Data, description: "Preprocesser metadata JSON"}
+  - {name: feature_selector, type: Data, description: "Optional feature selector pickle file (will be uploaded only if provided)"}
   - {name: bearer_token, type: string, description: "Bearer token for CDN authentication"}
   - {name: domain, type: String, description: "Upload service base domain"}
   - {name: get_cdn, type: String, description: "Public CDN base domain"}
 
 outputs:
-  - {name: test_data_cdn_url, type: String, description: "CDN URL for test data"}
-  - {name: preprocessed_data_cdn_url, type: String, description: "CDN URL for preprocessed data"}
-  - {name: preprocesser_pickle_cdn_url, type: String, description: "CDN URL for preprocesser pickle"}
-  - {name: preprocesser_metadata_cdn_url, type: String, description: "CDN URL for preprocesser metadata"}
+  - {name: test_data_cdn_url, type: String, description: "CDN URL for test data (or original value if not uploaded)"}
+  - {name: preprocessed_data_cdn_url, type: String, description: "CDN URL for preprocessed data (or original value if not uploaded)"}
+  - {name: preprocesser_pickle_cdn_url, type: String, description: "CDN URL for preprocesser pickle (or original value if not uploaded)"}
+  - {name: preprocesser_metadata_cdn_url, type: String, description: "CDN URL for preprocesser metadata (or original value if not uploaded)"}
+  - {name: feature_selector_cdn_url, type: String, description: "CDN URL for feature selector pickle (or original value if not uploaded)"}
 
 implementation:
   container:
@@ -34,25 +36,32 @@ implementation:
         import subprocess
         import json
         import os
+        import sys
 
         parser = argparse.ArgumentParser()
 
-        parser.add_argument('--test_data', type=str, required=True)
-        parser.add_argument('--preprocessed_data', type=str, required=True)
-        parser.add_argument('--preprocesser_pickle', type=str, required=True)
-        parser.add_argument('--preprocesser_metadata', type=str, required=True)
+        # Make file inputs optional: if not provided (or empty), we will not attempt upload.
+        parser.add_argument('--test_data', type=str, required=False, default="")
+        parser.add_argument('--preprocessed_data', type=str, required=False, default="")
+        parser.add_argument('--preprocesser_pickle', type=str, required=False, default="")
+        parser.add_argument('--preprocesser_metadata', type=str, required=False, default="")
+        parser.add_argument('--feature_selector', type=str, required=False, default="")
 
+        # Required config/auth
         parser.add_argument('--bearer_token', type=str, required=True)
         parser.add_argument('--domain', type=str, required=True)
         parser.add_argument('--get_cdn', type=str, required=True)
 
+        # Output paths (runner expects these to be created)
         parser.add_argument('--test_data_cdn_url', type=str, required=True)
         parser.add_argument('--preprocessed_data_cdn_url', type=str, required=True)
         parser.add_argument('--preprocesser_pickle_cdn_url', type=str, required=True)
         parser.add_argument('--preprocesser_metadata_cdn_url', type=str, required=True)
+        parser.add_argument('--feature_selector_cdn_url', type=str, required=True)
 
         args = parser.parse_args()
 
+        # Read bearer token (file path provided)
         with open(args.bearer_token, "r") as f:
             bearer_token = f.read().strip()
 
@@ -62,10 +71,8 @@ implementation:
             "?filePathAccess=private&filePath=%2Fbottle%2Flimka%2Fsoda%2F"
         )
 
-        def upload(file_path, output_path, prefix):
+        def upload(file_path):
             filename = os.path.basename(file_path)
-            cdn_name = f"{prefix}_{filename}"
-
             cmd = [
                 "curl",
                 "--location", upload_url,
@@ -74,31 +81,36 @@ implementation:
                 "--fail",
                 "--show-error"
             ]
-
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                check=True
-            )
-
+            result = subprocess.run(cmd, capture_output=True, check=True)
             response = json.loads(result.stdout.decode())
             relative_url = response.get("cdnUrl")
-
             if not relative_url:
                 raise RuntimeError(f"cdnUrl missing in response: {response}")
+            return f"{args.get_cdn}{relative_url}"
 
-            full_url = f"{args.get_cdn}{relative_url}"
-
+        def maybe_upload(input_path, output_path):
+            value_to_write = ""
+            if input_path and os.path.isfile(input_path):
+                try:
+                    value_to_write = upload(input_path)
+                except subprocess.CalledProcessError as e:
+                    # propagate a clear error with stdout/stderr for debugging
+                    sys.stderr.write(f"Upload failed for {input_path}: {e}\n")
+                    raise
+            else:
+                # Input not provided or file missing -> pass through the original value (or empty)
+                value_to_write = input_path or ""
             os.makedirs(os.path.dirname(output_path), exist_ok=True)
             with open(output_path, "w") as f:
-                f.write(full_url)
+                f.write(value_to_write)
+            return value_to_write
 
-            return full_url
-
-        upload(args.test_data, args.test_data_cdn_url, "test_data")
-        upload(args.preprocessed_data, args.preprocessed_data_cdn_url, "preprocessed_data")
-        upload(args.preprocesser_pickle, args.preprocesser_pickle_cdn_url, "preprocesser_pickle")
-        upload(args.preprocesser_metadata, args.preprocesser_metadata_cdn_url, "preprocesser_metadata")
+        # Perform conditional uploads
+        maybe_upload(args.test_data, args.test_data_cdn_url)
+        maybe_upload(args.preprocessed_data, args.preprocessed_data_cdn_url)
+        maybe_upload(args.preprocesser_pickle, args.preprocesser_pickle_cdn_url)
+        maybe_upload(args.preprocesser_metadata, args.preprocesser_metadata_cdn_url)
+        maybe_upload(args.feature_selector, args.feature_selector_cdn_url)
     args:
       - --test_data
       - {inputPath: test_data}
@@ -108,6 +120,8 @@ implementation:
       - {inputPath: preprocesser_pickle}
       - --preprocesser_metadata
       - {inputPath: preprocesser_metadata}
+      - --feature_selector
+      - {inputPath: feature_selector}
       - --bearer_token
       - {inputPath: bearer_token}
       - --domain
@@ -122,3 +136,5 @@ implementation:
       - {outputPath: preprocesser_pickle_cdn_url}
       - --preprocesser_metadata_cdn_url
       - {outputPath: preprocesser_metadata_cdn_url}
+      - --feature_selector_cdn_url
+      - {outputPath: feature_selector_cdn_url}
