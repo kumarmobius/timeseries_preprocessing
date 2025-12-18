@@ -100,7 +100,7 @@ implementation:
             "preprocessed_data_cdn": preprocessed_data_url,
             "preprocessor_cdn": preprocesser_pickle_url,
             "preprocessor_metadata_cdn": preprocesser_metadata_url,
-            "schema_timestamp_epoch": int(time.time())
+            "timestamp": int(time.time())
         }
 
         os.makedirs(os.path.dirname(args.schema_json), exist_ok=True)
