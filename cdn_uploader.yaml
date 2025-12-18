@@ -14,6 +14,7 @@ outputs:
   - {name: preprocessed_data_cdn_url, type: String, description: "CDN URL for preprocessed data"}
   - {name: preprocesser_pickle_cdn_url, type: String, description: "CDN URL for preprocesser pickle"}
   - {name: preprocesser_metadata_cdn_url, type: String, description: "CDN URL for preprocesser metadata"}
+  - {name: schema_json, type: String, description: "Schema JSON with CDN URLs and epoch timestamp"}
 
 implementation:
   container:
@@ -34,6 +35,7 @@ implementation:
         import subprocess
         import json
         import os
+        import time
 
         parser = argparse.ArgumentParser()
 
@@ -50,6 +52,7 @@ implementation:
         parser.add_argument('--preprocessed_data_cdn_url', type=str, required=True)
         parser.add_argument('--preprocesser_pickle_cdn_url', type=str, required=True)
         parser.add_argument('--preprocesser_metadata_cdn_url', type=str, required=True)
+        parser.add_argument('--schema_json', type=str, required=True)
 
         args = parser.parse_args()
 
@@ -62,10 +65,7 @@ implementation:
             "?filePathAccess=private&filePath=%2Fbottle%2Flimka%2Fsoda%2F"
         )
 
-        def upload(file_path, output_path, prefix):
-            filename = os.path.basename(file_path)
-            cdn_name = f"{prefix}_{filename}"
-
+        def upload(file_path, output_path):
             cmd = [
                 "curl",
                 "--location", upload_url,
@@ -75,15 +75,10 @@ implementation:
                 "--show-error"
             ]
 
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                check=True
-            )
-
+            result = subprocess.run(cmd, capture_output=True, check=True)
             response = json.loads(result.stdout.decode())
-            relative_url = response.get("cdnUrl")
 
+            relative_url = response.get("cdnUrl")
             if not relative_url:
                 raise RuntimeError(f"cdnUrl missing in response: {response}")
 
@@ -95,10 +90,23 @@ implementation:
 
             return full_url
 
-        upload(args.test_data, args.test_data_cdn_url, "test_data")
-        upload(args.preprocessed_data, args.preprocessed_data_cdn_url, "preprocessed_data")
-        upload(args.preprocesser_pickle, args.preprocesser_pickle_cdn_url, "preprocesser_pickle")
-        upload(args.preprocesser_metadata, args.preprocesser_metadata_cdn_url, "preprocesser_metadata")
+        test_data_url = upload(args.test_data, args.test_data_cdn_url)
+        preprocessed_data_url = upload(args.preprocessed_data, args.preprocessed_data_cdn_url)
+        preprocesser_pickle_url = upload(args.preprocesser_pickle, args.preprocesser_pickle_cdn_url)
+        preprocesser_metadata_url = upload(args.preprocesser_metadata, args.preprocesser_metadata_cdn_url)
+
+        schema = {
+            "test_data_cdn": test_data_url,
+            "preprocessed_data_cdn": preprocessed_data_url,
+            "preprocessor_cdn": preprocesser_pickle_url,
+            "preprocessor_metadata_cdn": preprocesser_metadata_url,
+            "schema_timestamp_epoch": int(time.time())
+        }
+
+        os.makedirs(os.path.dirname(args.schema_json), exist_ok=True)
+        with open(args.schema_json, "w") as f:
+            json.dump(schema, f, indent=2)
+
     args:
       - --test_data
       - {inputPath: test_data}
@@ -122,3 +130,5 @@ implementation:
       - {outputPath: preprocesser_pickle_cdn_url}
       - --preprocesser_metadata_cdn_url
       - {outputPath: preprocesser_metadata_cdn_url}
+      - --schema_json
+      - {outputPath: schema_json}
